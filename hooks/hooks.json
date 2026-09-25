@@ -1,0 +1,4 @@
+{
+  "description": "prompt.submit classifica il prompt; turn.step applica l'effort al turno principale.",
+  "modules": ["./effort-router.ts"]
+}

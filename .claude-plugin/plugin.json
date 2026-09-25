@@ -1,0 +1,57 @@
+{
+  "name": "effort-router",
+  "version": "0.3.1",
+  "description": "Abbassa il reasoning effort sui turni chiaramente semplici e lo riporta al default (high) al turno successivo. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello (la cache resta valida).",
+  "author": { "name": "Felice Marra" },
+  "license": "MIT",
+  "userConfig": {
+    "timeoutMs": {
+      "type": "number",
+      "title": "Tempo massimo di classificazione (ms)",
+      "description": "Oltre questo tempo il turno parte con l'effort predefinito",
+      "default": 1500
+    },
+    "minChars": {
+      "type": "number",
+      "title": "Lunghezza minima del prompt",
+      "description": "Prompt più corti (es. 'sì', 'procedi') sono spesso la continuazione di un task complesso: non vengono mai abbassati",
+      "default": 40
+    },
+    "maxChars": {
+      "type": "number",
+      "title": "Lunghezza massima del prompt",
+      "description": "Prompt più lunghi (spec, log, codice incollato) non sono quasi mai banali: restano all'effort predefinito senza chiamare Haiku",
+      "default": 2000
+    },
+    "routeSubagents": {
+      "type": "boolean",
+      "title": "Subagent: Haiku ed effort",
+      "description": "Classifica il compito di ogni subagent: i banali senza modello esplicito vanno su Haiku, i banali e semplici girano con l'effort più basso",
+      "default": true
+    },
+    "escalateAfter": {
+      "type": "number",
+      "title": "Rialza l'effort dopo N step",
+      "description": "Un turno abbassato che arriva a questo step del tool loop torna all'effort della sessione (0 = mai)",
+      "default": 8
+    },
+    "inheritShort": {
+      "type": "boolean",
+      "title": "Seguiti brevi ereditano la label",
+      "description": "Un prompt di pochi caratteri ('sì', 'ok procedi') dopo un turno banale o semplice ne eredita la label, per un turno solo",
+      "default": true
+    },
+    "cacheGuard": {
+      "type": "boolean",
+      "title": "Protezione della prompt cache",
+      "description": "Se le misure mostrano che cambiare effort invalida la cache, smette di abbassarlo sul turno principale",
+      "default": true
+    },
+    "logDecisions": {
+      "type": "boolean",
+      "title": "Mostra le decisioni",
+      "description": "Scrive ogni decisione nel log e nella status line",
+      "default": true
+    }
+  }
+}
