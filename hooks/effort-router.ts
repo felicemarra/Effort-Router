@@ -1,20 +1,22 @@
 /**
- * effort-router — abbassa l'effort dei turni chiaramente semplici.
+ * effort-router — abbassa l'effort dei turni semplici, lo alza su quelli difficili.
  *
- * prompt.submit: Haiku classifica il prompt (banale / semplice / complesso) in
+ * prompt.submit: Haiku classifica il prompt (banale / semplice / complesso / difficile) in
  * parallelo alla partenza del turno, così la sua latenza si sovrappone al
  * lavoro del motore invece di sommarsi. Un seguito brevissimo (`sì`, `ok`)
  * eredita la label del turno prima senza chiamare Haiku.
  * turn.step: al primo step del turno aspetta la classificazione, applica
  * l'effort deciso e lo mantiene per il tool loop; se il loop si allunga lo
  * riporta all'effort della sessione. Il turno dopo riparte dall'effort della
- * sessione. Non alza mai oltre quello e non cambia mai il modello.
- * agent.spawn: un subagent banale va su Haiku, uno semplice gira a effort
- * medium per tutta la sua corsa.
+ * sessione. Un turno difficile sale a `raiseTo` (default xhigh). Non cambia
+ * mai il modello.
+ * agent.spawn: un subagent banale va su Haiku, uno semplice su Sonnet a
+ * effort medium, uno difficile resta sul suo modello a effort `raiseTo`, per
+ * tutta la sua corsa.
  *
  * Misura: per ogni richiesta del turno principale registra quanta parte
  * dell'input ha servito la prompt cache, con l'effort invariato e cambiato.
- * Se cambiare effort risulta invalidare la cache, smette di abbassarlo sul
+ * Se cambiare effort risulta invalidare la cache, smette di cambiarlo sul
  * turno principale (cacheGuard). `/effort-router` mostra le statistiche.
  *
  * Haiku viene chiamato solo quando la risposta può cambiare qualcosa.
@@ -26,7 +28,7 @@ import {
   addUsage,
   CACHE_GAP_MS,
   cacheVerdict,
-  canLower,
+  canChange,
   canRouteSubagent,
   classifyPrompt,
   clip,
@@ -36,9 +38,13 @@ import {
   formatStats,
   inheritedLabel,
   isFastModel,
+  isLowered,
+  longPromptLabel,
+  MID_SUBAGENT_MODEL,
   mergeStats,
   newStats,
   parseLabel,
+  parseRaise,
   readStats,
   shouldClassify,
   shouldEscalate,
@@ -131,7 +137,7 @@ async function guarded($: EngineInterface, st: State, cacheGuard: boolean): Prom
   if (!cacheGuard || cacheVerdict(await getStats($, st)) !== 'busting') return false
   if (!st.guardAnnounced) {
     st.guardAnnounced = true
-    $.ui.log("[effort-router] cambiare effort invalida la prompt cache: sul turno principale l'effort non viene più abbassato (/effort-router)")
+    $.ui.log("[effort-router] cambiare effort invalida la prompt cache: sul turno principale l'effort non viene più cambiato (/effort-router)")
   }
   return true
 }
@@ -180,6 +186,9 @@ export const register: Register = (on, options) => {
   const cacheGuard = typeof options.cacheGuard === 'boolean' ? options.cacheGuard : true
   const log = typeof options.logDecisions === 'boolean' ? options.logDecisions : true
   const routeSubagents = typeof options.routeSubagents === 'boolean' ? options.routeSubagents : true
+  const sonnetForSimple = typeof options.sonnetForSimple === 'boolean' ? options.sonnetForSimple : true
+  // L'effort dei compiti difficili (xhigh, max) o null per non alzare mai.
+  const raiseTo = parseRaise(options.raiseTo)
 
   const st: State = { saved: null, delta: newStats(0), statsDirty: false, fastTypes: null, commandReady: false, guardAnnounced: false }
   // Una sola classificazione in attesa: i turni principali sono sequenziali.
@@ -189,6 +198,8 @@ export const register: Register = (on, options) => {
   let last: { label: Label | null; inherited: boolean } = { label: null, inherited: false }
   let appliedTurnId: string | undefined
   let applied: Effort | null = null
+  // Se `applied` è sotto l'effort della sessione (sopra = turno difficile).
+  let lowered = false
   let turnLabel: Label | null = null
   // L'effort della sessione all'ultimo turno (prima della riscrittura): se è già
   // low, il turno dopo non vale una chiamata a Haiku.
@@ -220,7 +231,7 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     if (!st.commandReady) {
       await ensureCommand($, st)
-      if (log) $.ui.log("[effort-router] attivo: abbassa l'effort solo sui turni semplici")
+      if (log) $.ui.log(`[effort-router] attivo: abbassa l'effort sui turni semplici${raiseTo ? `, lo alza a ${raiseTo} su quelli difficili` : ''}`)
     }
     // Consegnato dentro un turno già in corso: non apre un turno suo.
     if (e.turnId) return next(e)
@@ -235,11 +246,15 @@ export const register: Register = (on, options) => {
       if (log) $.ui.log(`[effort-router] prompt: ${inherited} (ereditata dal turno prima)`)
       return next(e)
     }
-    if (!shouldClassify(e.text, minChars, maxChars) || !canLower(sessionEffort)) return next(e)
+    // Un prompt lungo non si abbassa, ma può essere difficile: si classifica
+    // il suo inizio solo se c'è un effort a cui alzarlo.
+    const long = !shouldClassify(e.text, 0, maxChars)
+    if (!shouldClassify(e.text, minChars) || (long && !raiseTo) || !canChange(sessionEffort, raiseTo)) return next(e)
 
-    const classifying = classify($, st, e.text, timeoutMs).then(({ label, said }) => {
-      if (log) $.ui.log(`[effort-router] prompt: ${said}`)
-      return label
+    const classifying = classify($, st, long ? clip(e.text) : e.text, timeoutMs).then(({ label, said }) => {
+      const kept = long ? longPromptLabel(label) : label
+      if (log) $.ui.log(`[effort-router] prompt: ${said}${kept !== label ? ` (prompt lungo: ${kept})` : ''}`)
+      return kept
     })
     pending = classifying
     // Il turno parte subito; il primo turn.step aspetta la label. L'hook resta
@@ -252,8 +267,8 @@ export const register: Register = (on, options) => {
   })
 
   // Subagent: nessuna cache da perdere (partono da un contesto vuoto), quindi
-  // un compito banale va su Haiku se nessuno ha già scelto il modello, e uno
-  // banale o semplice gira con l'effort più basso per tutta la corsa.
+  // un compito banale va su Haiku e uno semplice su Sonnet se nessuno ha già
+  // scelto il modello; entrambi girano con l'effort più basso per tutta la corsa.
   on('agent.spawn', async ($, e, next) => {
     const fast = await getFastTypes($, st)
     const knownFast = canRouteSubagent(e) && fast.has(e.subagentType)
@@ -262,10 +277,11 @@ export const register: Register = (on, options) => {
     if (routeSubagents && subagentWorthClassifying(e, knownFast)) {
       const classified = await classify($, st, clip(`${e.description}\n\n${e.prompt}`), timeoutMs)
       label = classified.label
-      model = decideSubagentModel(label, e)
+      model = decideSubagentModel(label, e, sonnetForSimple)
       const s = st.delta
       s.subagents.classified++
-      if (model) s.subagents.toHaiku++
+      if (model === MID_SUBAGENT_MODEL) s.subagents.toSonnet++
+      else if (model) s.subagents.toHaiku++
       st.statsDirty = true
       if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): ${classified.said}${model ? ` → ${model}` : ''}`)
     }
@@ -286,9 +302,10 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     if (e.agentId) {
-      const effort = decideSubagentEffort(agentLabels.get(e.agentId) ?? null, e.effort)
+      const effort = decideSubagentEffort(agentLabels.get(e.agentId) ?? null, e.effort, raiseTo)
       if (effort && e.index === 0) {
-        st.delta.subagents.lowered++
+        if (isLowered(effort, e.effort)) st.delta.subagents.lowered++
+        else st.delta.subagents.raised++
         st.statsDirty = true
       }
       return yield* next(effort ? { ...e, effort } : e)
@@ -304,24 +321,28 @@ export const register: Register = (on, options) => {
       pendingInherited = false
       const label = waiting ? await waiting : null
       const guard = await guarded($, st, cacheGuard)
-      applied = guard ? null : decideEffort(label, e.effort)
+      applied = guard ? null : decideEffort(label, e.effort, raiseTo)
+      lowered = isLowered(applied, e.effort)
       appliedTurnId = e.turnId
       turnLabel = label
       last = { label, inherited }
 
       s.turns++
       if (label) s.labels[label]++
-      if (applied) s.lowered++
+      if (applied && lowered) s.lowered++
+      if (applied && !lowered) s.raised++
       if (applied && inherited) s.inherited++
       if (guard) s.guarded++
       if (log) {
         const now = applied ?? e.effort ?? 'default'
-        $.ui.status(`effort ${now}${label ? ` · ${label}` : ''}${applied ? ' · abbassato' : ''}${guard ? ' · cache guard' : ''}`)
+        const change = applied ? (lowered ? ' · abbassato' : ' · alzato') : ''
+        $.ui.status(`effort ${now}${label ? ` · ${label}` : ''}${change}${guard ? ' · cache guard' : ''}`)
         if (applied) $.ui.log(`[effort-router] turno → effort ${applied} (${label}${inherited ? ', ereditata' : ''})`)
       }
-    } else if (shouldEscalate(e.index, escalateAfter, applied)) {
+    } else if (shouldEscalate(e.index, escalateAfter, lowered)) {
       // Il tool loop si allunga: il compito non era semplice, né da ereditare.
       applied = null
+      lowered = false
       last = { label: null, inherited: false }
       s.escalated++
       if (log) {

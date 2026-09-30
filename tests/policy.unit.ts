@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   addUsage,
   cacheVerdict,
-  canLower,
+  canChange,
   canRouteSubagent,
   clip,
   decideEffort,
@@ -11,19 +11,27 @@ import {
   decideSubagentModel,
   formatStats,
   inheritedLabel,
+  isLowered,
+  longPromptLabel,
   mergeStats,
   newStats,
   parseLabel,
+  parseRaise,
   readStats,
   shouldClassify,
   shouldEscalate,
   subagentWorthClassifying,
 } from '../hooks/policy.ts'
 
-test('subagent: haiku solo se banale, senza modello esplicito, non fork', () => {
+test('subagent: haiku se banale, sonnet se semplice, senza modello esplicito, non fork', () => {
   const base = { fork: false, parentModel: 'claude-opus-5-5[1m]' }
   assert.equal(decideSubagentModel('banale', base), 'haiku')
-  assert.equal(decideSubagentModel('semplice', base), null)
+  assert.equal(decideSubagentModel('semplice', base), 'sonnet')
+  assert.equal(decideSubagentModel('semplice', base, false), null)
+  assert.equal(decideSubagentModel('semplice', { ...base, parentModel: 'claude-sonnet-5' }), null)
+  assert.equal(decideSubagentModel('banale', { ...base, parentModel: 'claude-sonnet-5' }), 'haiku')
+  assert.equal(decideSubagentModel('semplice', { ...base, parentModel: 'claude-fable-5-1' }), 'sonnet')
+  assert.equal(decideSubagentModel('semplice', { ...base, model: 'opus' }), null)
   assert.equal(decideSubagentModel('complesso', base), null)
   assert.equal(decideSubagentModel(null, base), null)
   assert.equal(decideSubagentModel('banale', { ...base, model: 'opus' }), null)
@@ -43,10 +51,47 @@ test('complesso non cambia nulla', () => {
   assert.equal(decideEffort('complesso', undefined), null)
 })
 
-test('non alza mai', () => {
+test('banale e semplice non alzano mai', () => {
   assert.equal(decideEffort('semplice', 'low'), null)
   assert.equal(decideEffort('semplice', 'medium'), null)
   assert.equal(decideEffort('banale', 'low'), null)
+})
+
+test('difficile alza fino a raiseTo, solo da high in su', () => {
+  assert.equal(decideEffort('difficile', 'high'), 'xhigh')
+  assert.equal(decideEffort('difficile', undefined), 'xhigh')
+  assert.equal(decideEffort('difficile', 'high', 'max'), 'max')
+  assert.equal(decideEffort('difficile', 'xhigh', 'max'), 'max')
+  assert.equal(decideEffort('difficile', 'xhigh'), null)
+  assert.equal(decideEffort('difficile', 'max'), null) // mai verso il basso
+  assert.equal(decideEffort('difficile', 'medium'), null) // scelta dell'utente
+  assert.equal(decideEffort('difficile', 'low'), null)
+  assert.equal(decideEffort('difficile', 'high', null), null)
+  assert.equal(decideEffort('difficile', 3), null)
+})
+
+test('parseRaise', () => {
+  assert.equal(parseRaise(undefined), 'xhigh')
+  assert.equal(parseRaise('max'), 'max')
+  assert.equal(parseRaise('xhigh'), 'xhigh')
+  assert.equal(parseRaise('off'), null)
+  assert.equal(parseRaise('high'), null)
+  assert.equal(parseRaise('low'), null)
+  assert.equal(parseRaise(5), null)
+})
+
+test('isLowered', () => {
+  assert.equal(isLowered('low', 'high'), true)
+  assert.equal(isLowered('medium', undefined), true)
+  assert.equal(isLowered('xhigh', 'high'), false)
+  assert.equal(isLowered(null, 'high'), false)
+})
+
+test('longPromptLabel: di un prompt lungo conta solo difficile', () => {
+  assert.equal(longPromptLabel('difficile'), 'difficile')
+  assert.equal(longPromptLabel('banale'), 'complesso')
+  assert.equal(longPromptLabel('semplice'), 'complesso')
+  assert.equal(longPromptLabel(null), null)
 })
 
 test('effort non confrontabile o nessuna label: nulla', () => {
@@ -67,12 +112,13 @@ test('prompt oltre maxChars non vengono classificati', () => {
   assert.equal(shouldClassify(lungo, 40), true)
 })
 
-test('canLower: con effort già low niente classificazione', () => {
-  assert.equal(canLower(undefined), true)
-  assert.equal(canLower('high'), true)
-  assert.equal(canLower('medium'), true)
-  assert.equal(canLower('low'), false)
-  assert.equal(canLower(3), false)
+test('canChange: con effort già low e niente da alzare niente classificazione', () => {
+  assert.equal(canChange(undefined, 'xhigh'), true)
+  assert.equal(canChange('high', null), true)
+  assert.equal(canChange('medium', 'xhigh'), true)
+  assert.equal(canChange('low', 'xhigh'), false)
+  assert.equal(canChange('max', null), true) // si può abbassare
+  assert.equal(canChange(3, 'xhigh'), false)
 })
 
 test('clip taglia solo i testi lunghi', () => {
@@ -92,12 +138,14 @@ test('parseLabel', () => {
   assert.equal(parseLabel('banale'), 'banale')
   assert.equal(parseLabel(' Semplice.\n'), 'semplice')
   assert.equal(parseLabel('complesso'), 'complesso')
+  assert.equal(parseLabel('Difficile'), 'difficile')
   assert.equal(parseLabel('banale o complesso'), null) // ambigua
   assert.equal(parseLabel('fast'), null)
   assert.equal(parseLabel(''), null)
 })
 
 test('inheritedLabel: solo seguiti brevissimi, mai complesso, mai due volte', () => {
+  assert.equal(inheritedLabel('procedi', { label: 'difficile', inherited: false }), 'difficile')
   const banale = { label: 'banale' as const, inherited: false }
   assert.equal(inheritedLabel('sì', banale), 'banale')
   assert.equal(inheritedLabel('ok procedi', { label: 'semplice', inherited: false }), 'semplice')
@@ -110,10 +158,10 @@ test('inheritedLabel: solo seguiti brevissimi, mai complesso, mai due volte', ()
 })
 
 test('shouldEscalate', () => {
-  assert.equal(shouldEscalate(8, 8, 'low'), true)
-  assert.equal(shouldEscalate(7, 8, 'low'), false)
-  assert.equal(shouldEscalate(20, 0, 'low'), false)
-  assert.equal(shouldEscalate(20, 8, null), false)
+  assert.equal(shouldEscalate(8, 8, true), true)
+  assert.equal(shouldEscalate(7, 8, true), false)
+  assert.equal(shouldEscalate(20, 0, true), false)
+  assert.equal(shouldEscalate(20, 8, false), false) // invariato o alzato
 })
 
 test('subagentWorthClassifying', () => {
@@ -131,6 +179,8 @@ test('decideSubagentEffort: un modello senza effort non si tocca', () => {
   assert.equal(decideSubagentEffort('banale', 'high'), 'low')
   assert.equal(decideSubagentEffort('semplice', undefined), null)
   assert.equal(decideSubagentEffort('complesso', 'high'), null)
+  assert.equal(decideSubagentEffort('difficile', 'high'), 'xhigh')
+  assert.equal(decideSubagentEffort('difficile', 'high', null), null)
 })
 
 test('readStats: riempie i buchi e scarta i valori non numerici', () => {
@@ -154,7 +204,7 @@ test('cacheVerdict', () => {
     addUsage(stats.cache.changed, { input_tokens: 50, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 950 })
   }
   assert.equal(cacheVerdict(stats), 'busting')
-  assert.match(formatStats(stats, ['veloce'], true), /INVALIDA la cache: abbassamento/)
+  assert.match(formatStats(stats, ['veloce'], true), /INVALIDA la cache: cambi di effort/)
 })
 
 test('mergeStats: somma gli incrementi e tiene la data più vecchia', () => {

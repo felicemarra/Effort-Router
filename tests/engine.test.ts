@@ -101,6 +101,19 @@ test('subagent banale senza modello: va su haiku', async ($, on) => {
   expect((await spawn($, on, 'banale')).model).toEqual('haiku')
 })
 
+test('subagent semplice senza modello: va su sonnet', async ($, on) => {
+  expect((await spawn($, on, 'semplice')).model).toEqual('sonnet')
+})
+
+test('subagent difficile: resta sul modello del padre a effort xhigh', async ($, on) => {
+  const seen: unknown[] = []
+  spawnBottom(on, 'difficile', { n: 0 }, seen)
+  const { agentId, model } = await spawnCall($)
+  expect(model).toEqual('claude-opus-5-5[1m]')
+  for await (const _ of $.turn.step({ turnId: 's1', index: 0, model: 'claude-opus-5-5[1m]', effort: 'high', messageCount: 1, agentId })) void _
+  expect(seen).toEqual(['xhigh'])
+})
+
 test('subagent complesso: eredita il modello del padre', async ($, on) => {
   expect((await spawn($, on, 'complesso')).model).toEqual('claude-opus-5-5[1m]')
 })
@@ -133,14 +146,68 @@ test('effort della sessione già low: il turno dopo non chiama Haiku', async ($,
   expect(seen).toEqual(['low', 'low'])
 })
 
-test('prompt oltre maxChars: nessuna classificazione', async ($, on) => {
+test('prompt oltre maxChars: classificato, ma non scende', async ($, on) => {
   const seen: unknown[] = []
   const calls = { n: 0 }
   bottom(on, 'banale', seen, calls)
   await $.prompt.submit({ text: 'mostrami il file '.repeat(200) })
   await step($, 't1', 0)
+  expect(calls.n).toEqual(1)
+  expect(seen).toEqual(['high'])
+})
+
+test('prompt oltre maxChars difficile: sale a xhigh', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'difficile', seen)
+  await $.prompt.submit({ text: 'analizza questo log di deadlock '.repeat(100) })
+  await step($, 't1', 0)
+  expect(seen).toEqual(['xhigh'])
+})
+
+test('prompt oltre maxChars con raiseTo off: nessuna classificazione', { options: { raiseTo: 'off' } }, async ($, on) => {
+  const seen: unknown[] = []
+  const calls = { n: 0 }
+  bottom(on, 'difficile', seen, calls)
+  await $.prompt.submit({ text: 'mostrami il file '.repeat(200) })
+  await step($, 't1', 0)
   expect(calls.n).toEqual(0)
   expect(seen).toEqual(['high'])
+})
+
+test('prompt difficile: xhigh per tutto il tool loop, anche lungo', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'difficile', seen)
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  for (let i = 0; i < 10; i++) await step($, 't1', i)
+  expect(seen).toEqual(Array(10).fill('xhigh'))
+  // Il seguito brevissimo resta difficile.
+  await $.prompt.submit({ text: 'procedi' })
+  await step($, 't2', 0)
+  expect(seen.at(-1)).toEqual('xhigh')
+})
+
+test('prompt difficile con raiseTo max: max', { options: { raiseTo: 'max' } }, async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'difficile', seen)
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0)
+  expect(seen).toEqual(['max'])
+})
+
+test('prompt difficile con raiseTo off: resta high', { options: { raiseTo: 'off' } }, async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'difficile', seen)
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0)
+  expect(seen).toEqual(['high'])
+})
+
+test('prompt difficile con effort della sessione medium: non alza', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'difficile', seen)
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0, 'medium')
+  expect(seen).toEqual(['medium'])
 })
 
 test('padre su haiku: il subagent non viene classificato', async ($, on) => {
@@ -272,6 +339,7 @@ test('statistiche salvate a fine turno e mostrate da /effort-router', async ($, 
   expect(saved.classifier.calls).toEqual(1)
   const { text } = await $.command.run({ command: 'effort-router' })
   expect(text).toContain('abbassati 1 (100%)')
+  expect(text).toContain('alzati 0')
   await $.command.run({ command: 'effort-router', args: 'reset' })
   expect((data.get('stats') as any).turns).toEqual(0)
 })
