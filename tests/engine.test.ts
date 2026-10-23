@@ -562,3 +562,131 @@ test('statistiche: rialzi per errore di un tool e prompt ultrathink', async ($, 
   expect(saved.deepThinking).toEqual(1)
   expect(saved.labels.difficile).toEqual(1)
 })
+
+test('il classificatore riceve la label del turno prima', async ($, on) => {
+  const prompts: string[] = []
+  on('model.complete', async ($: any, e: any) => (prompts.push(e.prompt), { value: { isAnswered: true, text: 'difficile', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.step', async function* ($: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: 'adesso fai lo stesso anche per gli altri due moduli' })
+  await step($, 't2', 0)
+  expect(prompts[0]).not.toContain('<turno-precedente>')
+  expect(prompts[1]).toContain('<turno-precedente>difficile</turno-precedente>')
+})
+
+test('statistiche salvate anche per versione; /effort-router tutto mostra il totale', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  // Il totale delle versioni prima.
+  const data = memoryStore(on, { stats: { since: 1, turns: 100, lowered: 40 } })
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect((data.get('stats') as any).turns).toEqual(101)
+  expect((data.get('stats@0.7.0') as any).turns).toEqual(1)
+  const { text } = await $.command.run({ command: 'effort-router' })
+  expect(text).toContain('statistiche della versione 0.7.0')
+  expect(text).toContain('Turni principali: 1 ')
+  expect(text).toContain('101 turni · abbassati 41')
+  const all = await $.command.run({ command: 'effort-router', args: 'tutto' })
+  expect(all.text).toContain('statistiche di tutte le versioni')
+  expect(all.text).toContain('Turni principali: 101 ')
+  await $.command.run({ command: 'effort-router', args: 'reset' })
+  expect((data.get('stats') as any).turns).toEqual(0)
+  expect((data.get('stats@0.7.0') as any).turns).toEqual(0)
+})
+
+test('il log "attivo" compare una volta, anche quando parte session.start', async ($, on) => {
+  const logs: string[] = []
+  on('model.complete', async () => ({ value: { isAnswered: true, text: 'complesso', usage: USAGE } }))
+  on('ui.log', async ($: any, e: any) => (logs.push(e.text), { value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('session.start', async ($: any, e: any) => ({ cwd: e.cwd }))
+  memoryStore(on)
+  await $.session.start({ cwd: '/progetto', surface: null, isInteractive: true })
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  expect(logs.filter(l => l.includes('0.7.0 attivo')).length).toEqual(1)
+})
+
+// Esperimento: 'h2' cade nel 10% di holdout, 't1'…'t5' no (vedi policy.unit.ts).
+test('holdout: un turno banale resta all effort della sessione', async ($, on) => {
+  const seen: unknown[] = []
+  const status: unknown[] = []
+  bottom(on, 'banale', seen, { n: 0 }, status)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 'h2', 0)
+  await step($, 'h2', 1)
+  expect(seen).toEqual(['high', 'high'])
+  expect(status).toEqual(['effort high · banale · holdout'])
+})
+
+test('holdout 0: nessun turno lasciato com era', { options: { holdout: 0 } }, async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 'h2', 0)
+  expect(seen).toEqual(['low'])
+})
+
+// Come bottom, con usage per gli step, tool che falliscono e lo store.
+function experimentBottom(on: any, reply: string) {
+  on('model.complete', async () => ({ value: { isAnswered: true, text: reply, usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.step', async function* ($: any, e: any) {
+    return {
+      turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn',
+      usage: { input_tokens: 10, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' },
+    }
+  })
+  on('tool.call', async () => ({ result: 'exit 1', text: 'exit 1', isError: true }))
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  return memoryStore(on)
+}
+
+async function complete($: any, turnId: string, isAborted = false) {
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted, turnId, reason: isAborted ? 'aborted' : 'answer' })
+}
+
+test('esperimento: step, token, allungati, interrotti e corretti per gruppo', async ($, on) => {
+  const data = experimentBottom(on, 'banale')
+  // Abbassato: un tool fallisce, il turno si allunga; poi l'utente corregge.
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await bash($)
+  await step($, 't1', 1)
+  await complete($, 't1')
+  // Holdout: stesso errore (contato, effort invariato), turno interrotto.
+  await $.prompt.submit({ text: 'no, non funziona: ' + LUNGO_BANALE })
+  await step($, 'h2', 0)
+  await bash($)
+  await step($, 'h2', 1)
+  await complete($, 'h2', true)
+  // Il prompt dopo il turno holdout non è una correzione.
+  await $.prompt.submit({ text: 'ok, adesso passa al file successivo per favore' })
+  await step($, 't2', 0)
+  await complete($, 't2')
+  const { banale } = (data.get('stats@0.7.0') as any).experiment
+  expect(banale.lowered).toEqual({ turns: 2, steps: 3, output: 300, stretched: 1, aborted: 0, corrected: 1 })
+  expect(banale.holdout).toEqual({ turns: 1, steps: 2, output: 200, stretched: 1, aborted: 1, corrected: 0 })
+})
+
+test('esperimento: turni complessi e difficili restano fuori', async ($, on) => {
+  const data = experimentBottom(on, 'complesso')
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: 'no, non funziona ancora' })
+  await step($, 't2', 0)
+  await complete($, 't2')
+  const { experiment } = data.get('stats') as any
+  expect(experiment.banale.lowered.turns + experiment.banale.holdout.turns + experiment.semplice.lowered.turns + experiment.semplice.holdout.turns).toEqual(0)
+  expect(experiment.banale.lowered.corrected).toEqual(0)
+})

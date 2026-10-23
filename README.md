@@ -11,6 +11,8 @@ Plugin di function hooks per Claude Code: **abbassa il reasoning effort sui turn
 
    Un turno alzato resta alzato.
 
+**Contesto**: insieme al prompt Haiku riceve la label del turno principale prima (se c'è), solo per capire le richieste che vi rimandano (`fai lo stesso anche per gli altri file`).
+
 **`ultrathink`**: un prompt che contiene `ultrathink`, `megathink`, `think hard`, `think harder`, `think really hard` (e simili) vale `difficile` senza chiamare Haiku, a qualunque lunghezza: non viene mai abbassato e sale a `raiseTo` se la sessione è a `high` o sopra.
 
 **Seguiti brevissimi** (fino a 20 caratteri: `sì`, `ok procedi`, `grazie`): dopo un turno `banale`, `semplice` o `difficile` ne ereditano la label senza chiamare Haiku. Vale per un turno solo, mai dopo un turno `complesso` o rialzato. Si disattiva con `inheritShort`.
@@ -41,13 +43,23 @@ Haiku viene chiamato solo quando la risposta può cambiare qualcosa. Non vengono
 - i subagent che girano già su Haiku: per modello esplicito, perché il padre è su Haiku, o perché il loro tipo ci finisce da solo (es. un agente con `model: haiku` nella definizione). Quest'ultimo il plugin lo impara alla prima occorrenza e lo ricorda tra le sessioni; se la definizione cambia, se ne accorge e lo dimentica.
 
 
+## Esperimento: abbassare peggiora le risposte?
+
+Un 10% dei turni da abbassare (`banale` o `semplice`, opzione `holdout`, da 0 a 50) resta all'effort della sessione: la status line dice `· holdout`. La scelta dipende dall'id del turno, quindi è casuale ma ripetibile. Per ogni label, `/effort-router` confronta i due gruppi:
+- step medi e token di output medi per turno;
+- **allungati**: turni arrivati a `escalateAfter` step o a un tool fallito (per gli abbassati sono i rialzi, per l'holdout quelli che lo sarebbero stati);
+- **interrotti**: turni fermati dall'utente;
+- **corretti**: turni seguiti da un prompt che corregge la risposta (`no`, `non funziona`, `hai sbagliato`, `riprova`, `doesn't work`, `still failing`…). È un'euristica: conta le correzioni esplicite, non quelle implicite.
+
+Se gli abbassati si allungano, vengono interrotti o corretti molto più spesso dell'holdout, abbassare costa qualità: è il dato per decidere se cambiare la mappa label → effort.
+
 ## Cache e statistiche
 
 Per ogni richiesta del turno principale fatta entro 4 minuti dalla precedente e con lo stesso modello, il plugin registra quanta parte dell'input ha servito la prompt cache, separando le richieste con l'**effort cambiato** da quelle con l'**effort invariato**. Con almeno 10 campioni per tipo:
 - se la quota servita dalla cache cala di oltre 30 punti quando l'effort cambia, cambiare effort invalida la cache: con `cacheGuard` attivo (default) il plugin smette di cambiare l'effort del turno principale (né abbassarlo né alzarlo), e smette anche di classificarne i prompt. L'effort dei subagent resta gestito: lo fissano all'avvio e non lo cambiano mai.
 - altrimenti continua come prima.
 
-`/effort-router` mostra turni abbassati e alzati, label (e quante `difficile` vengono da `ultrathink`), rialzi a metà turno per label (banale / semplice) e quanti per l'errore di un tool, costo del classificatore con le classificazioni senza label (timeout, errore, risposta non valida) e l'attesa media, subagent e le loro label, le due quote di cache e il verdetto. `/effort-router reset` azzera statistiche e tipi di subagent ricordati (per esempio per rimisurare dopo un aggiornamento di Claude Code). I dati stanno nello store del plugin (`~/.claude/plugins/store/effort-router_*.json`) e sono cumulativi tra tutte le sessioni: ogni sessione salva solo i propri incrementi, sommandoli al file riletto in quel momento, quindi più sessioni aperte in parallelo non si cancellano a vicenda. Se lo store non è disponibile il plugin funziona lo stesso, senza memoria.
+`/effort-router` mostra le statistiche della versione installata, con in coda una riga sul totale di tutte le versioni; `/effort-router tutto` mostra il dettaglio del totale. Per ognuna: turni abbassati e alzati, label (e quante `difficile` vengono da `ultrathink`), rialzi a metà turno per label (banale / semplice) e quanti per l'errore di un tool, costo del classificatore con le classificazioni senza label (timeout, errore, risposta non valida) e l'attesa media, subagent e le loro label, le due quote di cache e il verdetto. `/effort-router reset` azzera statistiche (della versione e totali) e tipi di subagent ricordati (per esempio per rimisurare dopo un aggiornamento di Claude Code). I dati stanno nello store del plugin (`~/.claude/plugins/store/effort-router_*.json`): `stats` per il totale, `stats@<versione>` per ogni versione (la versione va tenuta allineata in `plugin.json` e in `VERSION` di `hooks/policy.ts`: un test lo controlla). Sono cumulativi tra tutte le sessioni: ogni sessione salva solo i propri incrementi, sommandoli al file riletto in quel momento, quindi più sessioni aperte in parallelo non si cancellano a vicenda. Se lo store non è disponibile il plugin funziona lo stesso, senza memoria.
 
 Il prompt viene inviato solo ad Anthropic (Haiku), con le credenziali di Claude Code; nessun servizio di terzi.
 
@@ -65,7 +77,7 @@ In `~/.claude/settings.json` deve esserci:
 "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }
 ```
 
-Plugin id: `effort-router@skills-dir`. Le opzioni (`raiseTo`, `subagentRaiseTo`, `timeoutMs`, `minChars`, `maxChars`, `escalateAfter`, `escalateOnError`, `inheritShort`, `cacheGuard`, `routeSubagents`, `sonnetForSimple`, `logDecisions`) si cambiano dal menu config oppure in `pluginConfigs["effort-router@skills-dir"].options`.
+Plugin id: `effort-router@skills-dir`. Le opzioni (`raiseTo`, `subagentRaiseTo`, `timeoutMs`, `minChars`, `maxChars`, `escalateAfter`, `escalateOnError`, `holdout`, `inheritShort`, `cacheGuard`, `routeSubagents`, `sonnetForSimple`, `logDecisions`) si cambiano dal menu config oppure in `pluginConfigs["effort-router@skills-dir"].options`.
 
 ## Verificare
 

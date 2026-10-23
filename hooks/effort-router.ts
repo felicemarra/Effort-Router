@@ -44,21 +44,27 @@ import {
   folderName,
   formatStats,
   inheritedLabel,
+  isCorrection,
   isFastModel,
   isLowered,
   longPromptLabel,
   MID_SUBAGENT_MODEL,
   mergeStats,
   newStats,
+  parseHoldout,
   parseLabel,
   parseRaise,
+  pickArm,
   readStats,
   shouldClassify,
   shouldEscalate,
   subagentWorthClassifying,
   SYSTEM,
+  turnFraction,
+  VERSION,
+  versionStatsKey,
 } from './policy.ts'
-import type { Effort, Label, Stats } from './policy.ts'
+import type { Arm, Effort, Label, Stats, TestedLabel } from './policy.ts'
 
 const COMMAND = 'effort-router'
 // Quanti subagent ricordare per applicarne l'effort: i più vecchi escono.
@@ -66,13 +72,15 @@ const MAX_TRACKED_AGENTS = 200
 
 // Lo stato che gli helper qui sotto condividono con gli hook: uno per caricamento.
 type State = {
-  // Le statistiche all'ultima lettura dello store, e gli incrementi di questa
-  // sessione da allora: si sommano solo al salvataggio.
+  // Le statistiche all'ultima lettura dello store (il totale e quelle di
+  // questa versione), e gli incrementi di questa sessione da allora: si
+  // sommano a entrambe solo al salvataggio.
   saved: Stats | null
+  savedVersion: Stats | null
   delta: Stats
   statsDirty: boolean
   fastTypes: Set<string> | null
-  commandReady: boolean
+  started: boolean
   guardAnnounced: boolean
 }
 
@@ -113,9 +121,15 @@ async function save($: EngineInterface, key: string, value: unknown): Promise<vo
   }
 }
 
-// Le statistiche complessive: quelle salvate (lette alla prima occorrenza)
-// più gli incrementi di questa sessione.
-async function getStats($: EngineInterface, st: State): Promise<Stats> {
+const VERSION_KEY = versionStatsKey(VERSION)
+
+// Le statistiche di tutte le versioni (o solo di questa): quelle salvate
+// (lette alla prima occorrenza) più gli incrementi di questa sessione.
+async function getStats($: EngineInterface, st: State, onlyVersion = false): Promise<Stats> {
+  if (onlyVersion) {
+    st.savedVersion ??= readStats(await load($, VERSION_KEY), await clockNow($))
+    return mergeStats(st.savedVersion, st.delta)
+  }
   st.saved ??= readStats(await load($, 'stats'), await clockNow($))
   return mergeStats(st.saved, st.delta)
 }
@@ -124,10 +138,14 @@ async function getStats($: EngineInterface, st: State): Promise<Stats> {
 async function saveStats($: EngineInterface, st: State): Promise<void> {
   if (!st.statsDirty) return
   st.statsDirty = false
-  const merged = mergeStats(readStats(await load($, 'stats'), await clockNow($)), st.delta)
+  const now = await clockNow($)
+  const merged = mergeStats(readStats(await load($, 'stats'), now), st.delta)
+  const mergedVersion = mergeStats(readStats(await load($, VERSION_KEY), now), st.delta)
   st.delta = newStats(0)
   st.saved = merged
+  st.savedVersion = mergedVersion
   await save($, 'stats', merged)
+  await save($, VERSION_KEY, mergedVersion)
 }
 
 // Tipi di subagent che girano già su Haiku per definizione (es. un agente
@@ -159,18 +177,22 @@ async function guarded($: EngineInterface, st: State, cacheGuard: boolean): Prom
   return true
 }
 
-async function ensureCommand($: EngineInterface, st: State): Promise<void> {
-  if (st.commandReady) return
-  st.commandReady = true
+// Alla prima occorrenza (session.start o, se il plugin arriva a sessione
+// avviata, il primo prompt): registra il comando e dice che è attivo.
+async function start($: EngineInterface, st: State, announce: string | null): Promise<void> {
+  if (st.started) return
+  st.started = true
   try {
-    await $.command.register({ name: COMMAND, description: 'Statistiche di effort-router (reset per azzerarle)', argumentHint: '[reset]', immediate: true })
+    await $.command.register({ name: COMMAND, description: 'Statistiche di effort-router (tutto: di tutte le versioni; reset per azzerarle)', argumentHint: '[tutto|reset]', immediate: true })
   } catch {
     // Senza comando si perde solo il resoconto.
   }
+  if (announce) $.ui.log(announce)
 }
 
 // Haiku classifica un testo; null su timeout, errore o risposta non valida.
-async function classify($: EngineInterface, st: State, text: string, timeoutMs: number): Promise<{ label: Label | null; said: string }> {
+// `previous`: la label del turno prima, contesto per i rimandi.
+async function classify($: EngineInterface, st: State, text: string, timeoutMs: number, previous: Label | null = null): Promise<{ label: Label | null; said: string }> {
   const s = st.delta
   const startedAt = await clockNow($)
   let result: { label: Label | null; said: string }
@@ -178,7 +200,7 @@ async function classify($: EngineInterface, st: State, text: string, timeoutMs: 
     const reply = await $.model.complete({
       model: 'haiku',
       system: SYSTEM,
-      prompt: classifyPrompt(text),
+      prompt: classifyPrompt(text, previous),
       maxTokens: 5,
       effort: 'low',
       timeoutMs,
@@ -212,12 +234,15 @@ export const register: Register = (on, options) => {
   const log = typeof options.logDecisions === 'boolean' ? options.logDecisions : true
   const routeSubagents = typeof options.routeSubagents === 'boolean' ? options.routeSubagents : true
   const sonnetForSimple = typeof options.sonnetForSimple === 'boolean' ? options.sonnetForSimple : true
+  // La percentuale di turni da abbassare lasciati all'effort della sessione, per confronto.
+  const holdout = parseHoldout(options.holdout)
   // L'effort dei compiti difficili (xhigh, max) o null per non alzare mai.
   const raiseTo = parseRaise(options.raiseTo)
   // Lo stesso per i subagent: di default non si alza.
   const subagentRaiseTo = parseRaise(options.subagentRaiseTo, DEFAULT_SUBAGENT_RAISE)
 
-  const st: State = { saved: null, delta: newStats(0), statsDirty: false, fastTypes: null, commandReady: false, guardAnnounced: false }
+  const st: State = { saved: null, savedVersion: null, delta: newStats(0), statsDirty: false, fastTypes: null, started: false, guardAnnounced: false }
+  const announce = log ? `[effort-router] ${VERSION} attivo: abbassa l'effort sui turni semplici${raiseTo ? `, lo alza a ${raiseTo} su quelli difficili` : ''}` : null
   // Una sola classificazione in attesa: i turni principali sono sequenziali.
   let pending: Promise<Label | null> | null = null
   let pendingInherited = false
@@ -230,6 +255,10 @@ export const register: Register = (on, options) => {
   // Un tool del turno principale ha restituito un errore dall'ultimo step.
   let toolFailed = false
   let turnLabel: Label | null = null
+  // Il gruppo dell'esperimento del turno principale (banale o semplice da
+  // abbassare): resta fino al primo step del turno dopo, perché il prompt
+  // seguente dice se la risposta andava corretta.
+  let experiment: { label: TestedLabel; arm: Arm; stretched: boolean; judged: boolean } | null = null
   // L'effort della sessione all'ultimo turno (prima della riscrittura): se è già
   // low, il turno dopo non vale una chiamata a Haiku.
   let sessionEffort: unknown
@@ -239,31 +268,43 @@ export const register: Register = (on, options) => {
   const agentLabels = new Map<string, Label>()
 
   on('session.start', async ($, e, next) => {
-    await ensureCommand($, st)
+    await start($, st, announce)
     return next(e)
   })
 
   on('command.run', { command: COMMAND }, async ($, e) => {
-    if ((e.args ?? '').trim() === 'reset') {
-      st.saved = newStats(await clockNow($))
+    const arg = (e.args ?? '').trim()
+    if (arg === 'reset') {
+      const now = await clockNow($)
+      st.saved = newStats(now)
+      st.savedVersion = newStats(now)
       st.delta = newStats(0)
       st.statsDirty = false
       st.guardAnnounced = false
       await save($, 'stats', st.saved)
+      await save($, VERSION_KEY, st.savedVersion)
       st.fastTypes = new Set()
       await save($, 'fastTypes', [])
       return { text: 'effort-router: statistiche e tipi di subagent azzerati.' }
     }
-    return { text: formatStats(await getStats($, st), [...(await getFastTypes($, st))], cacheGuard) }
+    const fastTypes = [...(await getFastTypes($, st))]
+    const total = await getStats($, st)
+    if (arg === 'tutto') return { text: formatStats(total, fastTypes, cacheGuard) }
+    return { text: formatStats(await getStats($, st, true), fastTypes, cacheGuard, VERSION, total) }
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (!st.commandReady) {
-      await ensureCommand($, st)
-      if (log) $.ui.log(`[effort-router] attivo: abbassa l'effort sui turni semplici${raiseTo ? `, lo alza a ${raiseTo} su quelli difficili` : ''}`)
-    }
+    await start($, st, announce)
     // Consegnato dentro un turno già in corso: non apre un turno suo.
     if (e.turnId) return next(e)
+    // Il prompt dopo un turno dell'esperimento: corregge la risposta?
+    if (experiment && !experiment.judged) {
+      experiment.judged = true
+      if (isCorrection(e.text)) {
+        st.delta.experiment[experiment.label][experiment.arm].corrected++
+        st.statsDirty = true
+      }
+    }
     pending = null
     pendingInherited = false
     if (await guarded($, st, cacheGuard)) return next(e)
@@ -289,7 +330,7 @@ export const register: Register = (on, options) => {
     const long = !shouldClassify(e.text, 0, maxChars)
     if (!shouldClassify(e.text, minChars) || (long && !raiseTo) || !canChange(sessionEffort, raiseTo)) return next(e)
 
-    const classifying = classify($, st, long ? clip(e.text) : e.text, timeoutMs).then(({ label, said }) => {
+    const classifying = classify($, st, long ? clip(e.text) : e.text, timeoutMs, last.label).then(({ label, said }) => {
       const kept = long ? longPromptLabel(label) : label
       if (log) $.ui.log(`[effort-router] prompt: ${said}${kept !== label ? ` (prompt lungo: ${kept})` : ''}`)
       return kept
@@ -366,6 +407,14 @@ export const register: Register = (on, options) => {
       appliedTurnId = e.turnId
       turnLabel = label
       last = { label, inherited }
+      // Un turno da abbassare su `holdout` resta all'effort della sessione.
+      const tested = applied && lowered ? escalatedLabel(label) : null
+      experiment = tested ? { label: tested, arm: pickArm(holdout, turnFraction(e.turnId)), stretched: false, judged: false } : null
+      if (experiment) s.experiment[experiment.label][experiment.arm].turns++
+      if (experiment?.arm === 'holdout') {
+        applied = null
+        lowered = false
+      }
 
       s.turns++
       if (label) s.labels[label]++
@@ -375,9 +424,10 @@ export const register: Register = (on, options) => {
       if (guard) s.guarded++
       if (log) {
         const now = applied ?? e.effort ?? 'default'
-        const change = applied ? (lowered ? ' · abbassato' : ' · alzato') : ''
+        const change = applied ? (lowered ? ' · abbassato' : ' · alzato') : experiment ? ' · holdout' : ''
         $.ui.status(`${await folderPrefix($)}effort ${now}${label ? ` · ${label}` : ''}${change}${guard ? ' · cache guard' : ''}`)
         if (applied) $.ui.log(`[effort-router] turno → effort ${applied} (${label}${inherited ? ', ereditata' : ''})`)
+        else if (experiment) $.ui.log(`[effort-router] turno ${label} lasciato all'effort della sessione (holdout)`)
       }
     } else if (shouldEscalate(e.index, escalateAfter, lowered, toolFailed)) {
       // Il tool loop si allunga o un tool fallisce: il compito non era
@@ -389,18 +439,32 @@ export const register: Register = (on, options) => {
       last = { label: null, inherited: false }
       s.escalated++
       if (onError) s.escalatedOnError++
+      if (experiment && !experiment.stretched) {
+        experiment.stretched = true
+        s.experiment[experiment.label][experiment.arm].stretched++
+      }
       const by = escalatedLabel(turnLabel)
       if (by) s.escalatedBy[by]++
       if (log) {
         $.ui.status(`${await folderPrefix($)}effort ${e.effort ?? 'default'}${turnLabel ? ` · ${turnLabel}` : ''} · rialzato`)
         $.ui.log(`[effort-router] ${onError ? 'errore di un tool' : 'turno lungo'} (step ${e.index}) → effort della sessione`)
       }
+    } else if (experiment?.arm === 'holdout' && !experiment.stretched && shouldEscalate(e.index, escalateAfter, true, toolFailed)) {
+      // Un turno holdout che, abbassato, sarebbe stato rialzato qui.
+      experiment.stretched = true
+      toolFailed = false
+      s.experiment[experiment.label].holdout.stretched++
     }
     st.statsDirty = true
 
     const sent = applied ?? e.effort
     const startedAt = await clockNow($)
     const result = yield* next(applied ? { ...e, effort: applied } : e)
+    if (experiment) {
+      const arm = s.experiment[experiment.label][experiment.arm]
+      arm.steps++
+      arm.output += result.usage?.output_tokens ?? 0
+    }
 
     // Cache: si confrontano le richieste con cui la cache dovrebbe essere viva
     // (entro CACHE_GAP_MS dalla precedente, stesso modello), al primo step o a
@@ -414,16 +478,22 @@ export const register: Register = (on, options) => {
   })
 
   // Un tool del turno principale che restituisce un errore (comando fallito,
-  // Edit rifiutato, test rosso) rialza il turno abbassato allo step dopo. Un
-  // rifiuto dell'utente (`deny`) no: non dice nulla sulla difficoltà.
+  // Edit rifiutato, test rosso) rialza il turno abbassato allo step dopo (in
+  // un turno holdout lo segna soltanto). Un rifiuto dell'utente (`deny`) no:
+  // non dice nulla sulla difficoltà.
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
-    if (escalateOnError && lowered && !e.agentId && result.isError) toolFailed = true
+    const watched = lowered || experiment?.arm === 'holdout'
+    if (escalateOnError && watched && !e.agentId && result.isError) toolFailed = true
     return result
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (!e.agentId && e.isAborted && experiment && e.turnId === appliedTurnId) {
+      st.delta.experiment[experiment.label][experiment.arm].aborted++
+      st.statsDirty = true
+    }
     if (!e.agentId) await saveStats($, st)
     return result
   })
