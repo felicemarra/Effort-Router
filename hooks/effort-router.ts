@@ -420,7 +420,8 @@ export const register: Register = (on, options) => {
       if (label) s.labels[label]++
       if (applied && lowered) s.lowered++
       if (applied && !lowered) s.raised++
-      if (applied && inherited) s.inherited++
+      // Anche un turno ereditato finito in holdout ha ereditato la label.
+      if ((applied || experiment) && inherited) s.inherited++
       if (guard) s.guarded++
       if (log) {
         const now = applied ?? e.effort ?? 'default'

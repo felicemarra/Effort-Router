@@ -640,14 +640,22 @@ test('holdout anche su un turno ereditato: resta all effort della sessione', asy
   const calls = { n: 0 }
   const status: unknown[] = []
   bottom(on, 'banale', seen, calls, status)
+  const data = memoryStore(on)
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
   await $.prompt.submit({ text: LUNGO_BANALE })
   await step($, 't1', 0)
+  await complete($, 't1')
   await $.prompt.submit({ text: 'sì grazie' })
   await step($, 'h2', 0)
   await step($, 'h2', 1)
+  await complete($, 'h2')
   expect(seen).toEqual(['low', 'high', 'high'])
   expect(calls.n).toEqual(1)
   expect(status).toEqual(['effort low · banale · abbassato', 'effort high · banale · holdout'])
+  // Contato tra gli ereditati anche se resta all'effort della sessione.
+  const saved = data.get('stats') as any
+  expect(saved.inherited).toEqual(1)
+  expect(saved.lowered).toEqual(1)
 })
 
 // Come bottom, con usage per gli step, tool che falliscono e lo store.
