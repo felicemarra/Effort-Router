@@ -1,10 +1,26 @@
 {
   "name": "effort-router",
-  "version": "0.3.1",
-  "description": "Abbassa il reasoning effort sui turni chiaramente semplici e lo riporta al default (high) al turno successivo. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello (la cache resta valida).",
-  "author": { "name": "Felice Marra" },
+  "version": "0.6.0",
+  "description": "Abbassa il reasoning effort sui turni semplici e lo alza oltre il default (xhigh o max) su quelli difficili; ogni turno riparte dal default (high). I subagent banali vanno su Haiku, i semplici su Sonnet. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello del turno principale (la cache resta valida).",
+  "author": {
+    "name": "Felice Marra"
+  },
   "license": "MIT",
   "userConfig": {
+    "raiseTo": {
+      "type": "string",
+      "title": "Effort dei compiti difficili",
+      "description": "Un turno classificato difficile sale a questo effort (solo se la sessione è a high o sopra); off = non alzare mai",
+      "options": ["xhigh", "max", "off"],
+      "default": "xhigh"
+    },
+    "subagentRaiseTo": {
+      "type": "string",
+      "title": "Effort dei subagent difficili",
+      "description": "Un subagent classificato difficile sale a questo effort (solo se parte da high o sopra); off = resta al suo effort",
+      "options": ["off", "xhigh", "max"],
+      "default": "off"
+    },
     "timeoutMs": {
       "type": "number",
       "title": "Tempo massimo di classificazione (ms)",
@@ -15,25 +31,37 @@
       "type": "number",
       "title": "Lunghezza minima del prompt",
       "description": "Prompt più corti (es. 'sì', 'procedi') sono spesso la continuazione di un task complesso: non vengono mai abbassati",
-      "default": 40
+      "default": 12
     },
     "maxChars": {
       "type": "number",
       "title": "Lunghezza massima del prompt",
-      "description": "Prompt più lunghi (spec, log, codice incollato) non sono quasi mai banali: restano all'effort predefinito senza chiamare Haiku",
+      "description": "Prompt più lunghi (spec, log, codice incollato) non vengono mai abbassati: Haiku ne legge l'inizio solo per decidere se alzarli",
       "default": 2000
     },
     "routeSubagents": {
       "type": "boolean",
       "title": "Subagent: Haiku ed effort",
-      "description": "Classifica il compito di ogni subagent: i banali senza modello esplicito vanno su Haiku, i banali e semplici girano con l'effort più basso",
+      "description": "Classifica il compito di ogni subagent: i banali senza modello esplicito vanno su Haiku, i banali e semplici girano con l'effort più basso, i difficili con quello di raiseTo",
+      "default": true
+    },
+    "sonnetForSimple": {
+      "type": "boolean",
+      "title": "Subagent semplici su Sonnet",
+      "description": "Un subagent con un compito semplice e senza modello esplicito gira su Sonnet invece del modello della sessione",
       "default": true
     },
     "escalateAfter": {
       "type": "number",
       "title": "Rialza l'effort dopo N step",
       "description": "Un turno abbassato che arriva a questo step del tool loop torna all'effort della sessione (0 = mai)",
-      "default": 8
+      "default": 6
+    },
+    "escalateOnError": {
+      "type": "boolean",
+      "title": "Rialza l'effort se un tool fallisce",
+      "description": "Un turno abbassato in cui un tool restituisce un errore (comando fallito, Edit rifiutato) torna all'effort della sessione dallo step dopo",
+      "default": true
     },
     "inheritShort": {
       "type": "boolean",
@@ -44,7 +72,7 @@
     "cacheGuard": {
       "type": "boolean",
       "title": "Protezione della prompt cache",
-      "description": "Se le misure mostrano che cambiare effort invalida la cache, smette di abbassarlo sul turno principale",
+      "description": "Se le misure mostrano che cambiare effort invalida la cache, smette di cambiarlo sul turno principale",
       "default": true
     },
     "logDecisions": {
