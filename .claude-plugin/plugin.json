@@ -1,6 +1,6 @@
 {
   "name": "effort-router",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Abbassa il reasoning effort sui turni semplici e lo alza oltre il default (xhigh o max) su quelli difficili; ogni turno riparte dal default (high). I subagent banali vanno su Haiku, i semplici su Sonnet. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello del turno principale (la cache resta valida).",
   "author": {
     "name": "Felice Marra"
@@ -62,6 +62,12 @@
       "title": "Rialza l'effort se un tool fallisce",
       "description": "Un turno abbassato in cui un tool restituisce un errore (comando fallito, Edit rifiutato) torna all'effort della sessione dallo step dopo",
       "default": true
+    },
+    "holdout": {
+      "type": "number",
+      "title": "Holdout dell'esperimento (%)",
+      "description": "Percentuale dei turni banali e semplici lasciati all'effort della sessione, per confrontarli con quelli abbassati in /effort-router (0 = nessun confronto, massimo 50)",
+      "default": 10
     },
     "inheritShort": {
       "type": "boolean",

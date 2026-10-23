@@ -3,6 +3,11 @@ import assert from 'node:assert/strict'
 import {
   addUsage,
   asksDeepThinking,
+  isCorrection,
+  parseHoldout,
+  pickArm,
+  turnFraction,
+  classifyPrompt,
   cacheVerdict,
   canChange,
   canRouteSubagent,
@@ -25,6 +30,8 @@ import {
   shouldClassify,
   shouldEscalate,
   subagentWorthClassifying,
+  VERSION,
+  versionStatsKey,
 } from '../hooks/policy.ts'
 
 test('subagent: haiku se banale, sonnet se semplice, senza modello esplicito, non fork', () => {
@@ -300,4 +307,71 @@ test('folderName: ultimo segmento del percorso', () => {
   assert.equal(folderName('C:\\'), 'C:')
   assert.equal(folderName(''), null)
   assert.equal(folderName(undefined), null)
+})
+
+test('classifyPrompt: la label del turno prima solo se c\'è', () => {
+  assert.equal(classifyPrompt('fai lo stesso'), '<richiesta>\nfai lo stesso\n</richiesta>')
+  assert.equal(classifyPrompt('fai lo stesso', 'difficile'), '<turno-precedente>difficile</turno-precedente>\n<richiesta>\nfai lo stesso\n</richiesta>')
+  assert.equal(classifyPrompt('fai lo stesso', null), '<richiesta>\nfai lo stesso\n</richiesta>')
+})
+
+test('VERSION coincide con plugin.json', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const manifest = JSON.parse(await readFile(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'))
+  assert.equal(VERSION, manifest.version)
+  assert.equal(versionStatsKey('0.7.0'), 'stats@0.7.0')
+})
+
+test('formatStats: statistiche di una versione con la riga del totale', () => {
+  const version = newStats(Date.UTC(2026, 9, 24))
+  version.turns = 3
+  const total = newStats(Date.UTC(2026, 8, 25))
+  total.turns = 3239
+  total.lowered = 1105
+  total.raised = 86
+  const text = formatStats(version, [], true, '0.7.0', total)
+  assert.match(text, /statistiche della versione 0\.7\.0 dal 2026-10-24/)
+  assert.match(text, /Tutte le versioni, dal 2026-09-25: 3239 turni · abbassati 1105 · alzati 86/)
+  assert.match(formatStats(total, [], true), /statistiche di tutte le versioni dal 2026-09-25/)
+  assert.doesNotMatch(formatStats(total, [], true), /Tutte le versioni, dal/)
+})
+
+test('parseHoldout: percentuale fra 0 e 50, default 10', () => {
+  assert.equal(parseHoldout(undefined), 10)
+  assert.equal(parseHoldout('x'), 10)
+  assert.equal(parseHoldout(25), 25)
+  assert.equal(parseHoldout(-5), 0)
+  assert.equal(parseHoldout(90), 50)
+})
+
+test('pickArm e turnFraction: deterministico, uniforme sugli UUID', () => {
+  assert.equal(pickArm(10, 0.05), 'holdout')
+  assert.equal(pickArm(10, 0.1), 'lowered')
+  assert.equal(pickArm(0, 0), 'lowered')
+  assert.equal(turnFraction('h2'), turnFraction('h2'))
+  assert.equal(pickArm(10, turnFraction('h2')), 'holdout') // usato dai test sul motore
+  for (const id of ['t1', 't2', 't3', 't4', 't5', 's1']) assert.equal(pickArm(10, turnFraction(id)), 'lowered', id)
+  let held = 0
+  for (let i = 0; i < 20000; i++) if (pickArm(10, turnFraction(crypto.randomUUID())) === 'holdout') held++
+  assert.ok(held > 1800 && held < 2200, `holdout ${held} su 20000`)
+})
+
+test('isCorrection: le correzioni, non le conferme', () => {
+  for (const text of ['no, non quello', 'No.', 'non funziona', 'è sbagliato il percorso', 'hai sbagliato file', 'Ancora lo stesso errore', 'riprova', 'wrong file', "that's wrong", "it doesn't work", 'still failing', 'il test non va'])
+    assert.equal(isCorrection(text), true, text)
+  for (const text of ['ok procedi', 'sì grazie', 'no problem, go on', 'nota bene: usa tabs', 'normalizza i nomi', 'ora aggiungi i test', '/review no', 'errori di battitura nel README: correggili? sì'])
+    assert.equal(isCorrection(text), false, text)
+})
+
+test('readStats: uno store della 0.6 riceve l\'esperimento a zero', () => {
+  const stats = readStats({ turns: 9 }, 0)
+  assert.deepEqual(stats.experiment.banale.holdout, { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0 })
+})
+
+test('formatStats: righe dell\'esperimento', () => {
+  const stats = newStats(0)
+  Object.assign(stats.experiment.banale.lowered, { turns: 4, steps: 10, output: 800, stretched: 1, aborted: 0, corrected: 1 })
+  const text = formatStats(stats, [], true)
+  assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0% · corretti 25%/)
+  assert.match(text, /semplice holdout  : 0 turni · step medi — · token out medi —/)
 })
