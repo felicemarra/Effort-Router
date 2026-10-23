@@ -635,6 +635,21 @@ test('holdout 0: nessun turno lasciato com era', { options: { holdout: 0 } }, as
   expect(seen).toEqual(['low'])
 })
 
+test('holdout anche su un turno ereditato: resta all effort della sessione', async ($, on) => {
+  const seen: unknown[] = []
+  const calls = { n: 0 }
+  const status: unknown[] = []
+  bottom(on, 'banale', seen, calls, status)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: 'sì grazie' })
+  await step($, 'h2', 0)
+  await step($, 'h2', 1)
+  expect(seen).toEqual(['low', 'high', 'high'])
+  expect(calls.n).toEqual(1)
+  expect(status).toEqual(['effort low · banale · abbassato', 'effort high · banale · holdout'])
+})
+
 // Come bottom, con usage per gli step, tool che falliscono e lo store.
 function experimentBottom(on: any, reply: string) {
   on('model.complete', async () => ({ value: { isAnswered: true, text: reply, usage: USAGE } }))
