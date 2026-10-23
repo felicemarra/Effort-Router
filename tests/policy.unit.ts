@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   addUsage,
+  asksDeepThinking,
   cacheVerdict,
   canChange,
   canRouteSubagent,
@@ -9,6 +10,9 @@ import {
   decideEffort,
   decideSubagentEffort,
   decideSubagentModel,
+  DEFAULT_SUBAGENT_RAISE,
+  escalatedLabel,
+  folderName,
   formatStats,
   inheritedLabel,
   isLowered,
@@ -78,6 +82,21 @@ test('parseRaise', () => {
   assert.equal(parseRaise('high'), null)
   assert.equal(parseRaise('low'), null)
   assert.equal(parseRaise(5), null)
+})
+
+test('parseRaise per i subagent: senza opzione non si alza', () => {
+  assert.equal(parseRaise(undefined, DEFAULT_SUBAGENT_RAISE), null)
+  assert.equal(parseRaise('xhigh', DEFAULT_SUBAGENT_RAISE), 'xhigh')
+  assert.equal(parseRaise('off', DEFAULT_SUBAGENT_RAISE), null)
+  assert.equal(decideSubagentEffort('difficile', 'high', parseRaise(undefined, DEFAULT_SUBAGENT_RAISE)), null)
+})
+
+test('escalatedLabel: solo le label che abbassano', () => {
+  assert.equal(escalatedLabel('banale'), 'banale')
+  assert.equal(escalatedLabel('semplice'), 'semplice')
+  assert.equal(escalatedLabel('complesso'), null)
+  assert.equal(escalatedLabel('difficile'), null)
+  assert.equal(escalatedLabel(null), null)
 })
 
 test('isLowered', () => {
@@ -164,6 +183,27 @@ test('shouldEscalate', () => {
   assert.equal(shouldEscalate(20, 8, false), false) // invariato o alzato
 })
 
+test('shouldEscalate: un tool fallito rialza subito, solo un turno abbassato', () => {
+  assert.equal(shouldEscalate(1, 8, true, true), true)
+  assert.equal(shouldEscalate(1, 0, true, true), true) // anche con escalateAfter 0
+  assert.equal(shouldEscalate(1, 8, false, true), false) // invariato o alzato
+  assert.equal(shouldEscalate(1, 8, true, false), false)
+})
+
+test('asksDeepThinking: ultrathink e think hard, non le frasi comuni', () => {
+  assert.equal(asksDeepThinking('ultrathink'), true)
+  assert.equal(asksDeepThinking('Ultrathink: sistema il parser'), true)
+  assert.equal(asksDeepThinking('sistema il parser, think hard'), true)
+  assert.equal(asksDeepThinking('think harder about the cache'), true)
+  assert.equal(asksDeepThinking('think really hard'), true)
+  assert.equal(asksDeepThinking('think super hard'), true)
+  assert.equal(asksDeepThinking('megathink'), true)
+  assert.equal(asksDeepThinking('I think hardware is the problem'), false)
+  assert.equal(asksDeepThinking('pensaci bene'), false)
+  assert.equal(asksDeepThinking('think about it'), false)
+  assert.equal(asksDeepThinking('/review ultrathink'), false)
+})
+
 test('subagentWorthClassifying', () => {
   const base = { fork: false, parentModel: 'claude-opus-5-5[1m]' }
   assert.equal(subagentWorthClassifying(base, false), true)
@@ -190,6 +230,36 @@ test('readStats: riempie i buchi e scarta i valori non numerici', () => {
   assert.equal(stats.cache.same.n, 0)
   assert.equal('extra' in stats, false)
   assert.deepEqual(readStats(null, 7), newStats(7))
+})
+
+test('readStats: uno store della 0.5 riceve i campi nuovi a zero', () => {
+  const stats = readStats({ escalated: 160, classifier: { calls: 3, input: 9, output: 1 }, subagents: { raised: 4 } }, 0)
+  assert.equal(stats.escalated, 160)
+  assert.deepEqual(stats.escalatedBy, { banale: 0, semplice: 0 })
+  assert.equal(stats.escalatedOnError, 0)
+  assert.equal(stats.deepThinking, 0)
+  assert.equal(stats.classifier.calls, 3)
+  assert.equal(stats.classifier.failed, 0)
+  assert.equal(stats.classifier.ms, 0)
+  assert.equal(stats.subagents.raised, 4)
+  assert.equal(stats.subagents.labels.difficile, 0)
+})
+
+test('formatStats: rialzi per label, classificatore e label dei subagent', () => {
+  const stats = newStats(0)
+  stats.labels.banale = 10
+  stats.escalatedBy.banale = 2
+  stats.escalatedOnError = 1
+  stats.deepThinking = 5
+  stats.classifier.calls = 4
+  stats.classifier.failed = 1
+  stats.classifier.ms = 2000
+  stats.subagents.labels.difficile = 3
+  const text = formatStats(stats, [], true)
+  assert.match(text, /Rialzati a metà per label: banale 2 \(20%\) · semplice 0 \(—\) · per errore di un tool 1/)
+  assert.match(text, /di cui difficili per ultrathink 5/)
+  assert.match(text, /senza label 1 \(25%\) · attesa media 500 ms/)
+  assert.match(text, /Label dei subagent: banale 0 · semplice 0 · complesso 0 · difficile 3/)
 })
 
 test('cacheVerdict', () => {
@@ -221,4 +291,13 @@ test('mergeStats: somma gli incrementi e tiene la data più vecchia', () => {
   assert.equal(merged.since, 100)
   assert.equal(mergeStats(newStats(0), newStats(50)).since, 50)
   assert.equal(saved.turns, 3) // non muta gli argomenti
+})
+
+test('folderName: ultimo segmento del percorso', () => {
+  assert.equal(folderName('C:\\Users\\Marra\\Desktop'), 'Desktop')
+  assert.equal(folderName('C:\\Skills\\effort-router\\'), 'effort-router')
+  assert.equal(folderName('/home/u/progetto'), 'progetto')
+  assert.equal(folderName('C:\\'), 'C:')
+  assert.equal(folderName(''), null)
+  assert.equal(folderName(undefined), null)
 })

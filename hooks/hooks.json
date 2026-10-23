@@ -1,4 +1,4 @@
 {
-  "description": "prompt.submit classifica il prompt; turn.step applica l'effort al turno principale.",
+  "description": "prompt.submit classifica il prompt; turn.step applica l'effort al turno principale; tool.call rialza un turno abbassato quando un tool fallisce.",
   "modules": ["./effort-router.ts"]
 }

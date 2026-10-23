@@ -4,15 +4,17 @@
  * prompt.submit: Haiku classifica il prompt (banale / semplice / complesso / difficile) in
  * parallelo alla partenza del turno, così la sua latenza si sovrappone al
  * lavoro del motore invece di sommarsi. Un seguito brevissimo (`sì`, `ok`)
- * eredita la label del turno prima senza chiamare Haiku.
+ * eredita la label del turno prima senza chiamare Haiku; un prompt con
+ * `ultrathink` (o `think hard`…) vale difficile senza chiamarlo.
  * turn.step: al primo step del turno aspetta la classificazione, applica
- * l'effort deciso e lo mantiene per il tool loop; se il loop si allunga lo
- * riporta all'effort della sessione. Il turno dopo riparte dall'effort della
+ * l'effort deciso e lo mantiene per il tool loop; se il loop si allunga, o un
+ * tool restituisce un errore (tool.call), lo riporta all'effort della
+ * sessione. Il turno dopo riparte dall'effort della
  * sessione. Un turno difficile sale a `raiseTo` (default xhigh). Non cambia
  * mai il modello.
  * agent.spawn: un subagent banale va su Haiku, uno semplice su Sonnet a
- * effort medium, uno difficile resta sul suo modello a effort `raiseTo`, per
- * tutta la sua corsa.
+ * effort medium, uno difficile resta sul suo modello a effort
+ * `subagentRaiseTo` (default: nessun rialzo), per tutta la sua corsa.
  *
  * Misura: per ogni richiesta del turno principale registra quanta parte
  * dell'input ha servito la prompt cache, con l'effort invariato e cambiato.
@@ -26,6 +28,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import {
   addUsage,
+  asksDeepThinking,
   CACHE_GAP_MS,
   cacheVerdict,
   canChange,
@@ -35,6 +38,10 @@ import {
   decideEffort,
   decideSubagentEffort,
   decideSubagentModel,
+  DEFAULT_ESCALATE_AFTER,
+  DEFAULT_SUBAGENT_RAISE,
+  escalatedLabel,
+  folderName,
   formatStats,
   inheritedLabel,
   isFastModel,
@@ -76,6 +83,16 @@ async function clockNow($: EngineInterface): Promise<number> {
     return await $.clock.now()
   } catch {
     return Date.now()
+  }
+}
+
+// La cartella di lavoro della sessione, in testa alla status line; '' se non si sa.
+async function folderPrefix($: EngineInterface): Promise<string> {
+  try {
+    const name = folderName(await $.session.cwd())
+    return name ? `${name} · ` : ''
+  } catch {
+    return ''
   }
 }
 
@@ -154,6 +171,9 @@ async function ensureCommand($: EngineInterface, st: State): Promise<void> {
 
 // Haiku classifica un testo; null su timeout, errore o risposta non valida.
 async function classify($: EngineInterface, st: State, text: string, timeoutMs: number): Promise<{ label: Label | null; said: string }> {
+  const s = st.delta
+  const startedAt = await clockNow($)
+  let result: { label: Label | null; said: string }
   try {
     const reply = await $.model.complete({
       model: 'haiku',
@@ -163,25 +183,30 @@ async function classify($: EngineInterface, st: State, text: string, timeoutMs: 
       effort: 'low',
       timeoutMs,
     })
-    const s = st.delta
-    s.classifier.calls++
     s.classifier.input += reply.usage.input_tokens + reply.usage.cache_read_input_tokens + reply.usage.cache_creation_input_tokens
     s.classifier.output += reply.usage.output_tokens
-    st.statsDirty = true
-    if (!reply.isAnswered) return { label: null, said: reply.reason }
-    const label = parseLabel(reply.text)
-    return { label, said: label ?? `risposta non valida "${reply.text.slice(0, 20)}"` }
+    if (!reply.isAnswered) result = { label: null, said: reply.reason }
+    else {
+      const label = parseLabel(reply.text)
+      result = { label, said: label ?? `risposta non valida "${reply.text.slice(0, 20)}"` }
+    }
   } catch (error) {
-    return { label: null, said: `classificazione fallita: ${String(error)}` }
+    result = { label: null, said: `classificazione fallita: ${String(error)}` }
   }
+  s.classifier.calls++
+  s.classifier.ms += Math.max(0, (await clockNow($)) - startedAt)
+  if (!result.label) s.classifier.failed++
+  st.statsDirty = true
+  return result
 }
 
 export const register: Register = (on, options) => {
   // Il turno aspetta al massimo questo: resta ben dentro il budget di un hook (10 s).
   const timeoutMs = typeof options.timeoutMs === 'number' ? Math.min(Math.max(options.timeoutMs, 100), 8000) : 1500
-  const minChars = typeof options.minChars === 'number' ? options.minChars : 40
+  const minChars = typeof options.minChars === 'number' ? options.minChars : 12
   const maxChars = typeof options.maxChars === 'number' ? options.maxChars : 2000
-  const escalateAfter = typeof options.escalateAfter === 'number' ? options.escalateAfter : 8
+  const escalateAfter = typeof options.escalateAfter === 'number' ? options.escalateAfter : DEFAULT_ESCALATE_AFTER
+  const escalateOnError = typeof options.escalateOnError === 'boolean' ? options.escalateOnError : true
   const inheritShort = typeof options.inheritShort === 'boolean' ? options.inheritShort : true
   const cacheGuard = typeof options.cacheGuard === 'boolean' ? options.cacheGuard : true
   const log = typeof options.logDecisions === 'boolean' ? options.logDecisions : true
@@ -189,6 +214,8 @@ export const register: Register = (on, options) => {
   const sonnetForSimple = typeof options.sonnetForSimple === 'boolean' ? options.sonnetForSimple : true
   // L'effort dei compiti difficili (xhigh, max) o null per non alzare mai.
   const raiseTo = parseRaise(options.raiseTo)
+  // Lo stesso per i subagent: di default non si alza.
+  const subagentRaiseTo = parseRaise(options.subagentRaiseTo, DEFAULT_SUBAGENT_RAISE)
 
   const st: State = { saved: null, delta: newStats(0), statsDirty: false, fastTypes: null, commandReady: false, guardAnnounced: false }
   // Una sola classificazione in attesa: i turni principali sono sequenziali.
@@ -200,6 +227,8 @@ export const register: Register = (on, options) => {
   let applied: Effort | null = null
   // Se `applied` è sotto l'effort della sessione (sopra = turno difficile).
   let lowered = false
+  // Un tool del turno principale ha restituito un errore dall'ultimo step.
+  let toolFailed = false
   let turnLabel: Label | null = null
   // L'effort della sessione all'ultimo turno (prima della riscrittura): se è già
   // low, il turno dopo non vale una chiamata a Haiku.
@@ -238,6 +267,15 @@ export const register: Register = (on, options) => {
     pending = null
     pendingInherited = false
     if (await guarded($, st, cacheGuard)) return next(e)
+
+    // `ultrathink` e simili: l'utente ha già deciso, Haiku non serve.
+    if (asksDeepThinking(e.text)) {
+      pending = Promise.resolve<Label>('difficile')
+      st.delta.deepThinking++
+      st.statsDirty = true
+      if (log) $.ui.log('[effort-router] prompt: difficile (ultrathink)')
+      return next(e)
+    }
 
     const inherited = inheritShort ? inheritedLabel(e.text, last) : null
     if (inherited) {
@@ -280,6 +318,7 @@ export const register: Register = (on, options) => {
       model = decideSubagentModel(label, e, sonnetForSimple)
       const s = st.delta
       s.subagents.classified++
+      if (label) s.subagents.labels[label]++
       if (model === MID_SUBAGENT_MODEL) s.subagents.toSonnet++
       else if (model) s.subagents.toHaiku++
       st.statsDirty = true
@@ -302,7 +341,7 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     if (e.agentId) {
-      const effort = decideSubagentEffort(agentLabels.get(e.agentId) ?? null, e.effort, raiseTo)
+      const effort = decideSubagentEffort(agentLabels.get(e.agentId) ?? null, e.effort, subagentRaiseTo)
       if (effort && e.index === 0) {
         if (isLowered(effort, e.effort)) st.delta.subagents.lowered++
         else st.delta.subagents.raised++
@@ -323,6 +362,7 @@ export const register: Register = (on, options) => {
       const guard = await guarded($, st, cacheGuard)
       applied = guard ? null : decideEffort(label, e.effort, raiseTo)
       lowered = isLowered(applied, e.effort)
+      toolFailed = false
       appliedTurnId = e.turnId
       turnLabel = label
       last = { label, inherited }
@@ -336,18 +376,24 @@ export const register: Register = (on, options) => {
       if (log) {
         const now = applied ?? e.effort ?? 'default'
         const change = applied ? (lowered ? ' · abbassato' : ' · alzato') : ''
-        $.ui.status(`effort ${now}${label ? ` · ${label}` : ''}${change}${guard ? ' · cache guard' : ''}`)
+        $.ui.status(`${await folderPrefix($)}effort ${now}${label ? ` · ${label}` : ''}${change}${guard ? ' · cache guard' : ''}`)
         if (applied) $.ui.log(`[effort-router] turno → effort ${applied} (${label}${inherited ? ', ereditata' : ''})`)
       }
-    } else if (shouldEscalate(e.index, escalateAfter, lowered)) {
-      // Il tool loop si allunga: il compito non era semplice, né da ereditare.
+    } else if (shouldEscalate(e.index, escalateAfter, lowered, toolFailed)) {
+      // Il tool loop si allunga o un tool fallisce: il compito non era
+      // semplice, né da ereditare.
+      const onError = toolFailed
       applied = null
       lowered = false
+      toolFailed = false
       last = { label: null, inherited: false }
       s.escalated++
+      if (onError) s.escalatedOnError++
+      const by = escalatedLabel(turnLabel)
+      if (by) s.escalatedBy[by]++
       if (log) {
-        $.ui.status(`effort ${e.effort ?? 'default'}${turnLabel ? ` · ${turnLabel}` : ''} · rialzato`)
-        $.ui.log(`[effort-router] turno lungo (step ${e.index}) → effort della sessione`)
+        $.ui.status(`${await folderPrefix($)}effort ${e.effort ?? 'default'}${turnLabel ? ` · ${turnLabel}` : ''} · rialzato`)
+        $.ui.log(`[effort-router] ${onError ? 'errore di un tool' : 'turno lungo'} (step ${e.index}) → effort della sessione`)
       }
     }
     st.statsDirty = true
@@ -364,6 +410,15 @@ export const register: Register = (on, options) => {
       if (changed || e.index === 0) addUsage(changed ? s.cache.changed : s.cache.same, result.usage)
     }
     lastSent = { effort: sent, model: e.model, at: await clockNow($) }
+    return result
+  })
+
+  // Un tool del turno principale che restituisce un errore (comando fallito,
+  // Edit rifiutato, test rosso) rialza il turno abbassato allo step dopo. Un
+  // rifiuto dell'utente (`deny`) no: non dice nulla sulla difficoltà.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    if (escalateOnError && lowered && !e.agentId && result.isError) toolFailed = true
     return result
   })
 

@@ -1,6 +1,6 @@
 {
   "name": "effort-router",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Abbassa il reasoning effort sui turni semplici e lo alza oltre il default (xhigh o max) su quelli difficili; ogni turno riparte dal default (high). I subagent banali vanno su Haiku, i semplici su Sonnet. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello del turno principale (la cache resta valida).",
   "author": {
     "name": "Felice Marra"
@@ -10,9 +10,16 @@
     "raiseTo": {
       "type": "string",
       "title": "Effort dei compiti difficili",
-      "description": "Un turno o un subagent classificato difficile sale a questo effort (solo se la sessione è a high o sopra); off = non alzare mai",
+      "description": "Un turno classificato difficile sale a questo effort (solo se la sessione è a high o sopra); off = non alzare mai",
       "options": ["xhigh", "max", "off"],
       "default": "xhigh"
+    },
+    "subagentRaiseTo": {
+      "type": "string",
+      "title": "Effort dei subagent difficili",
+      "description": "Un subagent classificato difficile sale a questo effort (solo se parte da high o sopra); off = resta al suo effort",
+      "options": ["off", "xhigh", "max"],
+      "default": "off"
     },
     "timeoutMs": {
       "type": "number",
@@ -24,7 +31,7 @@
       "type": "number",
       "title": "Lunghezza minima del prompt",
       "description": "Prompt più corti (es. 'sì', 'procedi') sono spesso la continuazione di un task complesso: non vengono mai abbassati",
-      "default": 40
+      "default": 12
     },
     "maxChars": {
       "type": "number",
@@ -48,7 +55,13 @@
       "type": "number",
       "title": "Rialza l'effort dopo N step",
       "description": "Un turno abbassato che arriva a questo step del tool loop torna all'effort della sessione (0 = mai)",
-      "default": 8
+      "default": 6
+    },
+    "escalateOnError": {
+      "type": "boolean",
+      "title": "Rialza l'effort se un tool fallisce",
+      "description": "Un turno abbassato in cui un tool restituisce un errore (comando fallito, Edit rifiutato) torna all'effort della sessione dallo step dopo",
+      "default": true
     },
     "inheritShort": {
       "type": "boolean",

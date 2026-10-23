@@ -24,9 +24,19 @@ export const DEFAULT_RAISE: Effort = 'xhigh'
 /** Sotto questo effort della sessione non si alza mai: l'ha scelto l'utente. */
 const RAISE_FLOOR: Effort = 'high'
 
-/** L'opzione `raiseTo` come effort, o null (`off`, valori sconosciuti, o non sopra high). */
-export function parseRaise(value: unknown): Effort | null {
-  if (value === undefined) return DEFAULT_RAISE
+/**
+ * L'effort dei subagent difficili, se non configurato: nessun rialzo. I loro
+ * prompt li scrive il modello principale, lunghi e tecnici, e il
+ * classificatore li dice difficili molto più spesso dei prompt dell'utente.
+ */
+export const DEFAULT_SUBAGENT_RAISE: Effort | null = null
+
+/**
+ * L'opzione `raiseTo` (o `subagentRaiseTo`) come effort, o null (`off`,
+ * valori sconosciuti, o non sopra high). Se manca vale `fallback`.
+ */
+export function parseRaise(value: unknown, fallback: Effort | null = DEFAULT_RAISE): Effort | null {
+  if (value === undefined) return fallback
   const r = rank(value)
   return r !== null && r > rank(RAISE_FLOOR)! ? (value as Effort) : null
 }
@@ -58,6 +68,18 @@ function rank(effort: unknown): number | null {
   if (typeof effort !== 'string') return null
   const index = (EFFORT_ORDER as readonly string[]).indexOf(effort)
   return index === -1 ? null : index
+}
+
+// Le parole con cui l'utente chiede di ragionare a fondo (`ultrathink`, `think hard`…).
+const DEEP_THINKING = /\b(?:ultrathink|megathink|think\s+(?:(?:really|super|very)\s+)?(?:hard(?:er)?|intensely|longer|a\s+lot))\b/i
+
+/**
+ * Se il prompt chiede esplicitamente di ragionare a fondo: quel turno non si
+ * abbassa mai, vale `difficile` senza chiedere a Haiku. I comandi slash no.
+ */
+export function asksDeepThinking(prompt: string): boolean {
+  const text = prompt.trim()
+  return !text.startsWith('/') && DEEP_THINKING.test(text)
 }
 
 /**
@@ -175,13 +197,16 @@ export function inheritedLabel(prompt: string, previous: { label: Label | null; 
   return previous.label
 }
 
+/** Il default di `escalateAfter`. */
+export const DEFAULT_ESCALATE_AFTER = 6
+
 /**
  * Se un turno abbassato va riportato all'effort della sessione: un tool loop
- * che arriva a `escalateAfter` step non era un compito semplice. 0 = mai.
- * Un turno alzato resta alzato.
+ * che arriva a `escalateAfter` step (0 = mai), o un tool che ha restituito un
+ * errore, dicono che il compito non era semplice. Un turno alzato resta alzato.
  */
-export function shouldEscalate(index: number, escalateAfter: number, lowered: boolean): boolean {
-  return lowered && escalateAfter > 0 && index >= escalateAfter
+export function shouldEscalate(index: number, escalateAfter: number, lowered: boolean, toolFailed = false): boolean {
+  return lowered && (toolFailed || (escalateAfter > 0 && index >= escalateAfter))
 }
 
 /**
@@ -217,10 +242,17 @@ export type Stats = {
   raised: number
   inherited: number
   escalated: number
+  // I rialzi a metà turno per label: quale delle due sbaglia di più.
+  escalatedBy: { banale: number; semplice: number }
+  // Quanti rialzi a metà turno sono scattati per l'errore di un tool.
+  escalatedOnError: number
+  // I prompt con `ultrathink` o simili: difficili senza chiedere a Haiku.
+  deepThinking: number
   guarded: number
   labels: Record<Label, number>
-  classifier: { calls: number; input: number; output: number }
-  subagents: { classified: number; toHaiku: number; toSonnet: number; lowered: number; raised: number }
+  // `failed`: nessuna label (timeout, errore, risposta non valida); `ms`: attesa totale.
+  classifier: { calls: number; input: number; output: number; failed: number; ms: number }
+  subagents: { classified: number; toHaiku: number; toSonnet: number; lowered: number; raised: number; labels: Record<Label, number> }
   cache: { same: CacheBucket; changed: CacheBucket }
 }
 
@@ -232,10 +264,13 @@ export function newStats(now: number): Stats {
     raised: 0,
     inherited: 0,
     escalated: 0,
+    escalatedBy: { banale: 0, semplice: 0 },
+    escalatedOnError: 0,
+    deepThinking: 0,
     guarded: 0,
     labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 },
-    classifier: { calls: 0, input: 0, output: 0 },
-    subagents: { classified: 0, toHaiku: 0, toSonnet: 0, lowered: 0, raised: 0 },
+    classifier: { calls: 0, input: 0, output: 0, failed: 0, ms: 0 },
+    subagents: { classified: 0, toHaiku: 0, toSonnet: 0, lowered: 0, raised: 0, labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 } },
     cache: { same: { n: 0, read: 0, total: 0 }, changed: { n: 0, read: 0, total: 0 } },
   }
 }
@@ -305,6 +340,13 @@ export function cacheVerdict(stats: Stats): CacheVerdict {
 
 const pct = (part: number, whole: number) => (whole === 0 ? '—' : `${Math.round((part / whole) * 100)}%`)
 
+const labelCounts = (counts: Record<Label, number>) => LABELS.map(label => `${label} ${counts[label]}`).join(' · ')
+
+/** Se un turno rialzato a metà va contato per la sua label (solo banale e semplice si abbassano). */
+export function escalatedLabel(label: Label | null): 'banale' | 'semplice' | null {
+  return label === 'banale' || label === 'semplice' ? label : null
+}
+
 /** Il resoconto di `/effort-router`. */
 export function formatStats(stats: Stats, fastTypes: readonly string[], guard: boolean): string {
   const { same, changed } = stats.cache
@@ -320,9 +362,11 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     `effort-router — statistiche dal ${new Date(stats.since).toISOString().slice(0, 10)}`,
     '',
     `Turni principali: ${stats.turns} · abbassati ${stats.lowered} (${pct(stats.lowered, stats.turns)}) · alzati ${stats.raised} (${pct(stats.raised, stats.turns)}) · ereditati ${stats.inherited} · rialzati a metà ${stats.escalated} · sotto protezione cache ${stats.guarded}`,
-    `Label: banale ${stats.labels.banale} · semplice ${stats.labels.semplice} · complesso ${stats.labels.complesso} · difficile ${stats.labels.difficile}`,
-    `Classificatore Haiku: ${stats.classifier.calls} chiamate · ${stats.classifier.input} token in · ${stats.classifier.output} token out`,
+    `Label: ${labelCounts(stats.labels)} · di cui difficili per ultrathink ${stats.deepThinking}`,
+    `Rialzati a metà per label: banale ${stats.escalatedBy.banale} (${pct(stats.escalatedBy.banale, stats.labels.banale)}) · semplice ${stats.escalatedBy.semplice} (${pct(stats.escalatedBy.semplice, stats.labels.semplice)}) · per errore di un tool ${stats.escalatedOnError}`,
+    `Classificatore Haiku: ${stats.classifier.calls} chiamate · ${stats.classifier.input} token in · ${stats.classifier.output} token out · senza label ${stats.classifier.failed} (${pct(stats.classifier.failed, stats.classifier.calls)}) · attesa media ${stats.classifier.calls ? `${Math.round(stats.classifier.ms / stats.classifier.calls)} ms` : '—'}`,
     `Subagent: classificati ${stats.subagents.classified} · su Haiku ${stats.subagents.toHaiku} · su Sonnet ${stats.subagents.toSonnet} · effort abbassato ${stats.subagents.lowered} · alzato ${stats.subagents.raised}`,
+    `Label dei subagent: ${labelCounts(stats.subagents.labels)}`,
     '',
     `Cache al primo step del turno (entro ${CACHE_GAP_MS / 60_000} min dalla richiesta prima):`,
     `  effort invariato: ${same.n} richieste · ${pct(same.read, same.total)} dell'input dalla cache`,
@@ -331,4 +375,12 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     '',
     `Tipi di subagent già su Haiku: ${fastTypes.length ? fastTypes.join(', ') : 'nessuno'}`,
   ].join('\n')
+}
+
+// Il nome della cartella di lavoro (l'ultimo segmento del percorso), per la status line.
+export function folderName(path: unknown): string | null {
+  if (typeof path !== 'string') return null
+  const name = path.split(/[\\/]+/).filter(Boolean).pop()
+  // `C:\` resta `C:`: meglio di niente.
+  return name ?? null
 }
