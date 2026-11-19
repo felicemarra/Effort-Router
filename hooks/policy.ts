@@ -8,7 +8,7 @@
  */
 
 /** La versione del plugin, come in plugin.json: le statistiche si tengono anche per versione. */
-export const VERSION = '0.7.0'
+export const VERSION = '0.7.1'
 
 /** La chiave dello store con le statistiche di una versione (`stats` tiene il totale). */
 export function versionStatsKey(version: string): string {
@@ -265,6 +265,9 @@ export type Stats = {
   // L'esperimento: i turni banali e semplici abbassati e quelli lasciati
   // all'effort della sessione (holdout), da confrontare.
   experiment: Record<TestedLabel, Record<Arm, ArmStats>>
+  // Lo stesso per i subagent da spostare su Haiku o Sonnet: spostati
+  // (`lowered`) o lasciati sul modello e sull'effort che avrebbero (holdout).
+  subagentExperiment: Record<RoutedModel, Record<Arm, AgentArmStats>>
   labels: Record<Label, number>
   // `failed`: nessuna label (timeout, errore, risposta non valida); `ms`: attesa totale.
   classifier: { calls: number; input: number; output: number; failed: number; ms: number }
@@ -289,6 +292,20 @@ export type ArmStats = { turns: number; steps: number; output: number; stretched
 
 function newArm(): ArmStats {
   return { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0 }
+}
+
+/** I modelli verso cui un subagent può essere spostato. */
+export type RoutedModel = typeof FAST_SUBAGENT_MODEL | typeof MID_SUBAGENT_MODEL
+
+/**
+ * Un gruppo dell'esperimento sui subagent: come ArmStats, senza `corrected`
+ * (nessun prompt dell'utente segue un subagent). `stretched`: subagent
+ * arrivati a `escalateAfter` step o a un tool fallito.
+ */
+export type AgentArmStats = { agents: number; steps: number; output: number; stretched: number; aborted: number }
+
+function newAgentArm(): AgentArmStats {
+  return { agents: 0, steps: 0, output: 0, stretched: 0, aborted: 0 }
 }
 
 /** Il default di `holdout`: la percentuale di turni da abbassare lasciati com'erano. */
@@ -350,6 +367,10 @@ export function newStats(now: number): Stats {
     experiment: {
       banale: { lowered: newArm(), holdout: newArm() },
       semplice: { lowered: newArm(), holdout: newArm() },
+    },
+    subagentExperiment: {
+      haiku: { lowered: newAgentArm(), holdout: newAgentArm() },
+      sonnet: { lowered: newAgentArm(), holdout: newAgentArm() },
     },
     labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 },
     classifier: { calls: 0, input: 0, output: 0, failed: 0, ms: 0 },
@@ -456,6 +477,8 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     '',
     'Esperimento (abbassati contro holdout, lasciati all\'effort della sessione):',
     ...(['banale', 'semplice'] as const).flatMap(label => (['lowered', 'holdout'] as const).map(arm => `  ${label} ${arm === 'lowered' ? 'abbassati' : 'holdout  '}: ${armLine(stats.experiment[label][arm])}`)),
+    'Subagent (spostati contro holdout, lasciati sul loro modello):',
+    ...(['haiku', 'sonnet'] as const).flatMap(model => (['lowered', 'holdout'] as const).map(arm => `  ${model} ${arm === 'lowered' ? 'spostati' : 'holdout '}: ${agentArmLine(stats.subagentExperiment[model][arm])}`)),
     '',
     `Cache al primo step del turno (entro ${CACHE_GAP_MS / 60_000} min dalla richiesta prima):`,
     `  effort invariato: ${same.n} richieste · ${pct(same.read, same.total)} dell'input dalla cache`,
@@ -471,6 +494,10 @@ const avg = (sum: number, n: number) => (n === 0 ? '—' : `${Math.round(sum / n
 
 function armLine(a: ArmStats): string {
   return `${a.turns} turni · step medi ${a.turns ? (a.steps / a.turns).toFixed(1) : '—'} · token out medi ${avg(a.output, a.turns)} · allungati ${pct(a.stretched, a.turns)} · interrotti ${pct(a.aborted, a.turns)} · corretti ${pct(a.corrected, a.turns)}`
+}
+
+function agentArmLine(a: AgentArmStats): string {
+  return `${a.agents} subagent · step medi ${a.agents ? (a.steps / a.agents).toFixed(1) : '—'} · token out medi ${avg(a.output, a.agents)} · allungati ${pct(a.stretched, a.agents)} · interrotti ${pct(a.aborted, a.agents)}`
 }
 
 const day = (time: number) => new Date(time).toISOString().slice(0, 10)

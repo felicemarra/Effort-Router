@@ -375,3 +375,12 @@ test('formatStats: righe dell\'esperimento', () => {
   assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0% · corretti 25%/)
   assert.match(text, /semplice holdout  : 0 turni · step medi — · token out medi —/)
 })
+
+test('esperimento subagent: store vecchio a zero, righe nel resoconto', () => {
+  assert.deepEqual(readStats({ turns: 9 }, 0).subagentExperiment.sonnet.holdout, { agents: 0, steps: 0, output: 0, stretched: 0, aborted: 0 })
+  const stats = newStats(0)
+  Object.assign(stats.subagentExperiment.haiku.lowered, { agents: 4, steps: 10, output: 800, stretched: 1, aborted: 0 })
+  const text = formatStats(stats, [], true)
+  assert.match(text, /haiku spostati: 4 subagent · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0%/)
+  assert.match(text, /sonnet holdout : 0 subagent · step medi —/)
+})

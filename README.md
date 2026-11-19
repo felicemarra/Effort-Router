@@ -53,6 +53,8 @@ Un 10% dei turni da abbassare (`banale` o `semplice`, opzione `holdout`, da 0 a 
 
 Se gli abbassati si allungano, vengono interrotti o corretti molto più spesso dell'holdout, abbassare costa qualità: è il dato per decidere se cambiare la mappa label → effort.
 
+Lo stesso `holdout` vale per i subagent che il plugin sposterebbe su Haiku o Sonnet: una quota resta sul modello e sull'effort che avrebbe avuto (la scelta dipende dall'id della chiamata). `/effort-router` confronta spostati e holdout, per modello di destinazione, su step medi, token di output medi, allungati (`escalateAfter` step o un tool fallito, che nei subagent viene solo contato: nessun rialzo) e interrotti. Le correzioni non si contano: un subagent non riceve prompt dall'utente. Se gli spostati si allungano molto più dell'holdout, il modello più piccolo non basta per quella label.
+
 ## Cache e statistiche
 
 Per ogni richiesta del turno principale fatta entro 4 minuti dalla precedente e con lo stesso modello, il plugin registra quanta parte dell'input ha servito la prompt cache, separando le richieste con l'**effort cambiato** da quelle con l'**effort invariato**. Con almeno 10 campioni per tipo:

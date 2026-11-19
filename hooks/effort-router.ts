@@ -64,11 +64,17 @@ import {
   VERSION,
   versionStatsKey,
 } from './policy.ts'
-import type { Arm, Effort, Label, Stats, TestedLabel } from './policy.ts'
+import type { Arm, Effort, Label, RoutedModel, Stats, TestedLabel } from './policy.ts'
 
 const COMMAND = 'effort-router'
 // Quanti subagent ricordare per applicarne l'effort: i più vecchi escono.
 const MAX_TRACKED_AGENTS = 200
+
+// Ricorda un subagent in corsa; oltre MAX_TRACKED_AGENTS esce il più vecchio.
+function remember<T>(map: Map<string, T>, agentId: string, value: T): void {
+  map.set(agentId, value)
+  if (map.size > MAX_TRACKED_AGENTS) map.delete(map.keys().next().value!)
+}
 
 // Lo stato che gli helper qui sotto condividono con gli hook: uno per caricamento.
 type State = {
@@ -266,6 +272,8 @@ export const register: Register = (on, options) => {
   let lastSent: { effort: unknown; model: string; at: number } | null = null
   // Label dei subagent in corsa, per l'effort dei loro step.
   const agentLabels = new Map<string, Label>()
+  // Il gruppo dell'esperimento dei subagent in corsa da spostare su Haiku o Sonnet.
+  const agentExperiments = new Map<string, { model: RoutedModel; arm: Arm; stretched: boolean; toolFailed: boolean }>()
 
   on('session.start', async ($, e, next) => {
     await start($, st, announce)
@@ -353,23 +361,30 @@ export const register: Register = (on, options) => {
     const knownFast = canRouteSubagent(e) && fast.has(e.subagentType)
     let label: Label | null = null
     let model: string | null = null
+    let tested: { model: RoutedModel; arm: Arm } | null = null
     if (routeSubagents && subagentWorthClassifying(e, knownFast)) {
       const classified = await classify($, st, clip(`${e.description}\n\n${e.prompt}`), timeoutMs)
       label = classified.label
-      model = decideSubagentModel(label, e, sonnetForSimple)
+      const target = decideSubagentModel(label, e, sonnetForSimple) as RoutedModel | null
+      // Un subagent da spostare su `holdout` resta sul modello e sull'effort che avrebbe.
+      tested = target ? { model: target, arm: pickArm(holdout, turnFraction(e.tool_use_id ?? `${e.description}\n${e.prompt}`)) } : null
+      model = tested?.arm === 'lowered' ? tested.model : null
       const s = st.delta
       s.subagents.classified++
       if (label) s.subagents.labels[label]++
       if (model === MID_SUBAGENT_MODEL) s.subagents.toSonnet++
       else if (model) s.subagents.toHaiku++
       st.statsDirty = true
-      if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): ${classified.said}${model ? ` → ${model}` : ''}`)
+      if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): ${classified.said}${model ? ` → ${model}` : tested ? ` (holdout: niente ${tested.model})` : ''}`)
     }
     const result = await next(model ? { ...e, model } : e)
 
-    if (label && label !== 'complesso' && result.agentId) {
-      agentLabels.set(result.agentId, label)
-      if (agentLabels.size > MAX_TRACKED_AGENTS) agentLabels.delete(agentLabels.keys().next().value!)
+    if (result.agentId) {
+      if (label && label !== 'complesso' && tested?.arm !== 'holdout') remember(agentLabels, result.agentId, label)
+      if (tested) {
+        remember(agentExperiments, result.agentId, { ...tested, stretched: false, toolFailed: false })
+        st.delta.subagentExperiment[tested.model][tested.arm].agents++
+      }
     }
     // Senza il nostro intervento il tipo è finito su Haiku: lo sceglie da sé.
     // Se un tipo noto non ci finisce più, la sua definizione è cambiata.
@@ -388,7 +403,19 @@ export const register: Register = (on, options) => {
         else st.delta.subagents.raised++
         st.statsDirty = true
       }
-      return yield* next(effort ? { ...e, effort } : e)
+      const exp = agentExperiments.get(e.agentId)
+      if (exp && !exp.stretched && shouldEscalate(e.index, escalateAfter, true, exp.toolFailed)) {
+        exp.stretched = true
+        st.delta.subagentExperiment[exp.model][exp.arm].stretched++
+      }
+      const result = yield* next(effort ? { ...e, effort } : e)
+      if (exp) {
+        const arm = st.delta.subagentExperiment[exp.model][exp.arm]
+        arm.steps++
+        arm.output += result.usage?.output_tokens ?? 0
+        st.statsDirty = true
+      }
+      return result
     }
 
     const s = st.delta
@@ -486,6 +513,9 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const watched = lowered || experiment?.arm === 'holdout'
     if (escalateOnError && watched && !e.agentId && result.isError) toolFailed = true
+    // Nell'esperimento dei subagent l'errore di un tool lo segna soltanto.
+    const exp = e.agentId ? agentExperiments.get(e.agentId) : undefined
+    if (escalateOnError && exp && result.isError) exp.toolFailed = true
     return result
   })
 
@@ -493,6 +523,11 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (!e.agentId && e.isAborted && experiment && e.turnId === appliedTurnId) {
       st.delta.experiment[experiment.label][experiment.arm].aborted++
+      st.statsDirty = true
+    }
+    const exp = e.agentId ? agentExperiments.get(e.agentId) : undefined
+    if (exp && e.isAborted) {
+      st.delta.subagentExperiment[exp.model][exp.arm].aborted++
       st.statsDirty = true
     }
     if (!e.agentId) await saveStats($, st)

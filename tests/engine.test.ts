@@ -590,9 +590,9 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   await step($, 't1', 0)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   expect((data.get('stats') as any).turns).toEqual(101)
-  expect((data.get('stats@0.7.0') as any).turns).toEqual(1)
+  expect((data.get('stats@0.7.1') as any).turns).toEqual(1)
   const { text } = await $.command.run({ command: 'effort-router' })
-  expect(text).toContain('statistiche della versione 0.7.0')
+  expect(text).toContain('statistiche della versione 0.7.1')
   expect(text).toContain('Turni principali: 1 ')
   expect(text).toContain('101 turni · abbassati 41')
   const all = await $.command.run({ command: 'effort-router', args: 'tutto' })
@@ -600,7 +600,7 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   expect(all.text).toContain('Turni principali: 101 ')
   await $.command.run({ command: 'effort-router', args: 'reset' })
   expect((data.get('stats') as any).turns).toEqual(0)
-  expect((data.get('stats@0.7.0') as any).turns).toEqual(0)
+  expect((data.get('stats@0.7.1') as any).turns).toEqual(0)
 })
 
 test('il log "attivo" compare una volta, anche quando parte session.start', async ($, on) => {
@@ -612,7 +612,7 @@ test('il log "attivo" compare una volta, anche quando parte session.start', asyn
   memoryStore(on)
   await $.session.start({ cwd: '/progetto', surface: null, isInteractive: true })
   await $.prompt.submit({ text: LUNGO_COMPLESSO })
-  expect(logs.filter(l => l.includes('0.7.0 attivo')).length).toEqual(1)
+  expect(logs.filter(l => l.includes('0.7.1 attivo')).length).toEqual(1)
 })
 
 // Esperimento: 'h2' cade nel 10% di holdout, 't1'…'t5' no (vedi policy.unit.ts).
@@ -697,7 +697,7 @@ test('esperimento: step, token, allungati, interrotti e corretti per gruppo', as
   await $.prompt.submit({ text: 'ok, adesso passa al file successivo per favore' })
   await step($, 't2', 0)
   await complete($, 't2')
-  const { banale } = (data.get('stats@0.7.0') as any).experiment
+  const { banale } = (data.get('stats@0.7.1') as any).experiment
   expect(banale.lowered).toEqual({ turns: 2, steps: 3, output: 300, stretched: 1, aborted: 0, corrected: 1 })
   expect(banale.holdout).toEqual({ turns: 1, steps: 2, output: 200, stretched: 1, aborted: 1, corrected: 0 })
 })
@@ -712,4 +712,39 @@ test('esperimento: turni complessi e difficili restano fuori', async ($, on) => 
   const { experiment } = data.get('stats') as any
   expect(experiment.banale.lowered.turns + experiment.banale.holdout.turns + experiment.semplice.lowered.turns + experiment.semplice.holdout.turns).toEqual(0)
   expect(experiment.banale.lowered.corrected).toEqual(0)
+})
+
+test('esperimento subagent: spostato su haiku contro holdout sul modello del padre', async ($, on) => {
+  const seen: unknown[] = []
+  on('model.complete', async () => ({ value: { isAnswered: true, text: 'banale', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('turn.step', async function* ($: any, e: any) {
+    seen.push(`${e.agentId}:${e.effort}`)
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, output_tokens: 50 } }
+  })
+  on('tool.call', async () => ({ result: 'exit 1', text: 'exit 1', isError: true }))
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  const data = memoryStore(on)
+  on('agent.spawn', async ($: any, e: any) => ({ model: e.model ?? e.parentModel, agentId: `a-${e.tool_use_id}` }))
+  // tu1 finisce fra gli spostati, h2 nell'holdout (vedi pickArm nei test di policy).
+  const moved = await spawnCall($, { tool_use_id: 'tu1' })
+  const held = await spawnCall($, { tool_use_id: 'h2' })
+  expect(moved.model).toEqual('haiku')
+  expect(held.model).toEqual('claude-opus-5-5[1m]')
+  for (const agentId of ['a-tu1', 'a-h2']) {
+    for await (const _ of $.turn.step({ turnId: 's1', index: 0, model: 'm', effort: 'high', messageCount: 1, agentId })) void _
+  }
+  // L'holdout tiene anche l'effort che avrebbe.
+  expect(seen).toEqual(['a-tu1:low', 'a-h2:high'])
+  // Un tool fallito nello spostato lo segna allungato allo step dopo.
+  await bash($, 'a-tu1')
+  for await (const _ of $.turn.step({ turnId: 's1', index: 1, model: 'm', effort: 'high', messageCount: 1, agentId: 'a-tu1' })) void _
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 's1', reason: 'aborted', agentId: 'a-h2' })
+  await complete($, 't1')
+  const { subagentExperiment: x, subagents } = data.get('stats') as any
+  expect(x.haiku.lowered).toEqual({ agents: 1, steps: 2, output: 100, stretched: 1, aborted: 0 })
+  expect(x.haiku.holdout).toEqual({ agents: 1, steps: 1, output: 50, stretched: 0, aborted: 1 })
+  expect(x.sonnet.lowered.agents + x.sonnet.holdout.agents).toEqual(0)
+  expect(subagents.toHaiku).toEqual(1)
 })
