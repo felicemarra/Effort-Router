@@ -4,8 +4,8 @@ Plugin di function hooks per Claude Code: **abbassa il reasoning effort sui turn
 
 ## Come funziona
 
-1. `prompt.submit`: Haiku classifica il prompt (`banale` / `semplice` / `complesso` / `difficile`), con un timeout di 1,5 s. La classificazione corre **in parallelo** alla partenza del turno: la sua latenza si sovrappone alla preparazione della richiesta invece di sommarsi.
-2. `turn.step`: al primo step del turno aspetta la label (se non è già arrivata), applica l'effort e lo mantiene per il tool loop. Un turno abbassato torna all'effort della sessione per il resto del turno quando il compito si rivela meno semplice del previsto:
+1. `prompt.submit`: Haiku classifica il prompt (`banale` / `semplice` / `complesso` / `difficile`), con un timeout di 1,5 s (`timeoutMs`). Dopo 50 classificazioni misurate il timeout si adatta: scende al p95 della loro durata con un margine del 50%, mai sotto 300 ms né sopra `timeoutMs` (`adaptiveTimeout`, default attivo; `/effort-router` mostra quello in uso). La classificazione corre **in parallelo** alla partenza del turno: la sua latenza si sovrappone alla preparazione della richiesta invece di sommarsi.
+2. `turn.step`: al primo step del turno aspetta la label (se non è già arrivata), applica l'effort e lo mantiene per il tool loop. Con `labelWaitMs` (default 0 = aspetta sempre) il primo step aspetta al più quei millisecondi, ma solo se il verdetto della cache è `ok`: oltre, parte all'effort della sessione e la label vale dallo step in cui arriva. Così sparisce la latenza aggiunta, al prezzo di non abbassare i turni di un solo step; questi turni restano fuori dall'esperimento e `/effort-router` li conta come "label arrivate dopo il primo step". Un turno abbassato torna all'effort della sessione per il resto del turno quando il compito si rivela meno semplice del previsto:
    - arriva allo step 6 (`escalateAfter`);
    - un tool del turno principale restituisce un errore (comando con exit ≠ 0, Edit rifiutato, test rosso): dallo step dopo (`escalateOnError`). Un rifiuto dell'utente a un permesso non conta, né l'errore di un subagent.
 
@@ -30,13 +30,13 @@ Plugin di function hooks per Claude Code: **abbassa il reasoning effort sui turn
 - `banale` e nessun modello indicato → parte su Haiku;
 - `semplice` e nessun modello indicato → parte su Sonnet (opzione `sonnetForSimple`), solo se il padre è sopra Sonnet (Opus, Fable);
 - `difficile` → resta sul suo modello e sul suo effort; con l'opzione `subagentRaiseTo` (`xhigh` o `max`, default `off`) sale a quell'effort. Di default non sale perché i prompt dei subagent li scrive il modello principale, lunghi e tecnici: il classificatore li diceva difficili nel 18% dei casi, contro il 3,5% dei prompt dell'utente;
-- `banale` o `semplice` → gira a effort `low` / `medium` per tutta la corsa (anche con un `model` esplicito, se quel modello ha l'effort).
+- `banale` o `semplice` → parte a effort `low` / `medium` (anche con un `model` esplicito, se quel modello ha l'effort) e torna all'effort di partenza, come un turno principale, se arriva a `escalateAfter` step o un suo tool restituisce un errore (`/effort-router`: "rialzati a metà"). Il modello resta quello scelto.
 
-I fork non vengono mai toccati (ereditano contesto e cache del padre). Al classificatore arrivano al massimo i primi 4000 caratteri del compito. Si disattiva con l'opzione `routeSubagents`.
+I fork non vengono mai toccati (ereditano contesto e cache del padre). Al classificatore arrivano al massimo i primi 4000 caratteri del compito, con criteri propri: i compiti dei subagent li scrive il modello, lunghi e tecnici per natura, quindi lunghezza e gergo non contano come difficoltà, e cercare, leggere e riassumere vale `banale`. Si disattiva con l'opzione `routeSubagents`.
 
 Haiku viene chiamato solo quando la risposta può cambiare qualcosa. Non vengono classificati:
 - i prompt sotto i 12 caratteri (`sì`, `procedi`, …), che spesso proseguono un task complesso;
-- i prompt sopra i 2000 caratteri (spec, log, codice incollato) quando `raiseTo` è `off`; altrimenti Haiku ne legge i primi 4000 caratteri e conta solo `difficile`, perché un prompt lungo non viene mai abbassato;
+- i prompt sopra i 2000 caratteri (spec, log, codice incollato) quando `raiseTo` è `off`; altrimenti Haiku ne legge i primi 1000 e gli ultimi 500 caratteri (la richiesta vera sta quasi sempre in testa o in coda a un log incollato) e conta solo `difficile`, perché un prompt lungo non viene mai abbassato;
 - i comandi slash;
 - i messaggi consegnati dentro un turno già in corso;
 - i prompt quando l'effort della sessione all'ultimo turno era già `low` (nessuna label potrebbe cambiarlo);
@@ -50,7 +50,9 @@ Un 10% dei turni da abbassare (`banale` o `semplice`, opzione `holdout`, da 0 a 
 - step medi e token di output medi per turno;
 - **allungati**: turni arrivati a `escalateAfter` step o a un tool fallito (per gli abbassati sono i rialzi, per l'holdout quelli che lo sarebbero stati);
 - **interrotti**: turni fermati dall'utente;
-- **corretti**: turni seguiti da un prompt che corregge la risposta (`no`, `non funziona`, `hai sbagliato`, `riprova`, `doesn't work`, `still failing`…). È un'euristica: conta le correzioni esplicite, non quelle implicite.
+- **corretti**: turni seguiti da un prompt che corregge la risposta (`no`, `non funziona`, `hai sbagliato`, `riprova`, `intendevo`, `volevo dire`, `doesn't work`, `I meant`, `still failing`…). Un comando slash rimanda il giudizio al prompt dopo; `/clear` (o `/new`, `/reset`) lo chiude senza correzione. È un'euristica: conta le correzioni esplicite, non quelle implicite.
+
+Accanto a ogni quota c'è l'intervallo di confidenza al 95% (Wilson): con pochi turni è largo, e due gruppi si possono dire diversi solo quando i loro intervalli si separano.
 
 Se gli abbassati si allungano, vengono interrotti o corretti molto più spesso dell'holdout, abbassare costa qualità: è il dato per decidere se cambiare la mappa label → effort.
 
@@ -62,7 +64,7 @@ Per ogni richiesta del turno principale fatta entro 4 minuti dalla precedente e 
 - se la quota servita dalla cache cala di oltre 30 punti quando l'effort cambia, cambiare effort invalida la cache: con `cacheGuard` attivo (default) il plugin smette di cambiare l'effort del turno principale (né abbassarlo né alzarlo), e smette anche di classificarne i prompt. L'effort dei subagent resta gestito: lo fissano all'avvio e non lo cambiano mai.
 - altrimenti continua come prima.
 
-`/effort-router` mostra le statistiche della versione installata, con in coda una riga sul totale di tutte le versioni; `/effort-router tutto` mostra il dettaglio del totale. Per ognuna: turni abbassati e alzati, label (e quante `difficile` vengono da `ultrathink`), rialzi a metà turno per label (banale / semplice) e quanti per l'errore di un tool, costo del classificatore con le classificazioni senza label (timeout, errore, risposta non valida) e l'attesa media, subagent e le loro label, le due quote di cache (su tutto il periodo) e il verdetto (sulla finestra di 14 giorni, con il numero di campioni). `/effort-router reset` azzera statistiche (della versione e totali), misure della cache per giorno e tipi di subagent ricordati (per esempio per rimisurare subito dopo un aggiornamento di Claude Code). I dati stanno nello store del plugin (`~/.claude/plugins/store/effort-router_*.json`): `stats` per il totale, `stats@<versione>` per ogni versione (la versione va tenuta allineata in `plugin.json` e in `VERSION` di `hooks/policy.ts`: un test lo controlla). Sono cumulativi tra tutte le sessioni: ogni sessione salva solo i propri incrementi, sommandoli al file riletto in quel momento, quindi più sessioni aperte in parallelo non si cancellano a vicenda. Se lo store non è disponibile il plugin funziona lo stesso, senza memoria.
+`/effort-router` mostra le statistiche della versione installata, con in coda una riga sul totale di tutte le versioni; `/effort-router tutto` mostra il dettaglio del totale. Per ognuna: turni abbassati e alzati, label (e quante `difficile` vengono da `ultrathink`), rialzi a metà turno per label (banale / semplice) e quanti per l'errore di un tool, costo del classificatore con le classificazioni senza label (timeout, errore, risposta non valida) e la durata media della chiamata, l'attesa che il primo step di un turno classificato fa davvero per la label (media, p50 e p95: la chiamata a Haiku parte insieme al turno, quindi l'attesa è di solito più corta della durata; è il dato per tarare `timeoutMs`), subagent e le loro label, le due quote di cache (su tutto il periodo) e il verdetto (sulla finestra di 14 giorni, con il numero di campioni). `/effort-router reset` azzera statistiche (della versione e totali), misure della cache per giorno e tipi di subagent ricordati (per esempio per rimisurare subito dopo un aggiornamento di Claude Code). I dati stanno nello store del plugin (`~/.claude/plugins/store/effort-router_*.json`): `stats` per il totale, `stats@<versione>` per ogni versione (la versione va tenuta allineata in `plugin.json` e in `VERSION` di `hooks/policy.ts`: un test lo controlla). Sono cumulativi tra tutte le sessioni: ogni sessione salva solo i propri incrementi, a fine turno al più una volta al minuto (`saveEveryMs`) e sempre a fine sessione, sommandoli al file riletto in quel momento, quindi più sessioni aperte in parallelo non si cancellano a vicenda. Se lo store non è disponibile il plugin funziona lo stesso, senza memoria.
 
 Il prompt viene inviato solo ad Anthropic (Haiku), con le credenziali di Claude Code; nessun servizio di terzi.
 
@@ -80,7 +82,7 @@ In `~/.claude/settings.json` deve esserci:
 "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }
 ```
 
-Plugin id: `effort-router@skills-dir`. Le opzioni (`raiseTo`, `subagentRaiseTo`, `timeoutMs`, `minChars`, `maxChars`, `escalateAfter`, `escalateOnError`, `holdout`, `inheritShort`, `cacheGuard`, `routeSubagents`, `sonnetForSimple`, `logDecisions`) si cambiano dal menu config oppure in `pluginConfigs["effort-router@skills-dir"].options`.
+Plugin id: `effort-router@skills-dir`. Le opzioni (`raiseTo`, `subagentRaiseTo`, `timeoutMs`, `minChars`, `maxChars`, `escalateAfter`, `escalateOnError`, `holdout`, `inheritShort`, `cacheGuard`, `routeSubagents`, `sonnetForSimple`, `adaptiveTimeout`, `labelWaitMs`, `saveEveryMs`, `logDecisions`) si cambiano dal menu config oppure in `pluginConfigs["effort-router@skills-dir"].options`.
 
 ## Verificare
 

@@ -1,6 +1,6 @@
 {
   "name": "effort-router",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Abbassa il reasoning effort sui turni semplici e lo alza oltre il default (xhigh o max) su quelli difficili; ogni turno riparte dal default (high). I subagent banali vanno su Haiku, i semplici su Sonnet. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello del turno principale (la cache resta valida).",
   "author": {
     "name": "Felice Marra"
@@ -24,8 +24,26 @@
     "timeoutMs": {
       "type": "number",
       "title": "Tempo massimo di classificazione (ms)",
-      "description": "Oltre questo tempo il turno parte con l'effort predefinito",
+      "description": "Oltre questo tempo il turno parte con l'effort predefinito. Con adaptiveTimeout è il tetto",
       "default": 1500
+    },
+    "adaptiveTimeout": {
+      "type": "boolean",
+      "title": "Timeout adattivo",
+      "description": "Dopo 50 classificazioni misurate il timeout scende al p95 della loro durata con un margine del 50% (mai sotto 300 ms, mai sopra timeoutMs)",
+      "default": true
+    },
+    "labelWaitMs": {
+      "type": "number",
+      "title": "Attesa massima della label al primo step (ms)",
+      "description": "0 = il primo step aspetta la label. Con un valore e la cache verificata (cambiare effort non la invalida), oltre questo tempo il primo step parte all'effort della sessione e la label vale dallo step dopo",
+      "default": 0
+    },
+    "saveEveryMs": {
+      "type": "number",
+      "title": "Intervallo minimo tra i salvataggi delle statistiche (ms)",
+      "description": "A fine turno le statistiche si salvano al più una volta in questo intervallo (0 = a ogni turno); a fine sessione sempre",
+      "default": 60000
     },
     "minChars": {
       "type": "number",
@@ -36,7 +54,7 @@
     "maxChars": {
       "type": "number",
       "title": "Lunghezza massima del prompt",
-      "description": "Prompt più lunghi (spec, log, codice incollato) non vengono mai abbassati: Haiku ne legge l'inizio solo per decidere se alzarli",
+      "description": "Prompt più lunghi (spec, log, codice incollato) non vengono mai abbassati: Haiku ne legge inizio e fine solo per decidere se alzarli",
       "default": 2000
     },
     "routeSubagents": {
