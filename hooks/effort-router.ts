@@ -46,6 +46,7 @@ import {
   decideSubagentModel,
   DEFAULT_ESCALATE_AFTER,
   DEFAULT_SUBAGENT_RAISE,
+  editedFile,
   escalatedLabel,
   folderName,
   formatStats,
@@ -286,6 +287,8 @@ type Turn = {
   experiment: { label: TestedLabel; arm: Arm; stretched: boolean; judged: boolean } | null
   // La label non ancora arrivata al primo step (`labelWaitMs`): vale dallo step in cui arriva.
   late: { label: Promise<Label | null>; inherited: boolean } | null
+  // I file che il turno ha modificato: se il turno dopo ci rimette mano, il turno va rifatto.
+  edited: Set<string>
 }
 
 // Un subagent in corsa: la label che ne decide l'effort e il suo gruppo dell'esperimento.
@@ -385,6 +388,9 @@ export const register: Register = (on, options) => {
   // La label del turno principale precedente, per i seguiti brevissimi.
   let last: { label: Label | null; inherited: boolean } = { label: null, inherited: false }
   let turn: Turn | null = null
+  // Il turno dell'esperimento prima di quello in corso, se ha modificato file:
+  // il turno in corso che ne modifica uno di nuovo lo segna come rifatto.
+  let reviewing: { experiment: NonNullable<Turn['experiment']>; edited: Set<string>; counted: boolean } | null = null
   // L'effort della sessione all'ultimo turno (prima della riscrittura): se è già
   // low, il turno dopo non vale una chiamata a Haiku.
   let sessionEffort: unknown
@@ -583,7 +589,8 @@ export const register: Register = (on, options) => {
         else label = got
         if (classified) addWait(s.firstStepWait, Math.max(0, (await clockNow($)) - waitStart))
       }
-      turn = { id: e.turnId, label: null, applied: null, lowered: false, toolFailed: false, experiment: null, late: late ? { label: late, inherited } : null }
+      reviewing = turn?.experiment && turn.edited.size ? { experiment: turn.experiment, edited: turn.edited, counted: false } : null
+      turn = { id: e.turnId, label: null, applied: null, lowered: false, toolFailed: false, experiment: null, late: late ? { label: late, inherited } : null, edited: new Set() }
       s.turns++
       if (guard) s.guarded++
       if (late) {
@@ -657,6 +664,15 @@ export const register: Register = (on, options) => {
   // dell'utente (`deny`) no: non dice nulla sulla difficoltà.
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
+    const file = !e.agentId && !('deny' in result) && !result.isError ? editedFile(e as Record<string, unknown>) : null
+    if (file && turn) {
+      turn.edited.add(file)
+      if (reviewing && !reviewing.counted && reviewing.edited.has(file)) {
+        reviewing.counted = true
+        st.delta.experiment[reviewing.experiment.label][reviewing.experiment.arm].reworked++
+        st.statsDirty = true
+      }
+    }
     if (!escalateOnError || !result.isError) return result
     if (e.agentId) {
       const a = agents.get(e.agentId)

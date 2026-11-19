@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   addUsage,
+  editedFile,
   asksDeepThinking,
   isCorrection,
   judgePrompt,
@@ -375,14 +376,14 @@ test('isCorrection: le correzioni, non le conferme', () => {
 
 test('readStats: uno store della 0.6 riceve l\'esperimento a zero', () => {
   const stats = readStats({ turns: 9 }, 0)
-  assert.deepEqual(stats.experiment.banale.holdout, { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0 })
+  assert.deepEqual(stats.experiment.banale.holdout, { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0, reworked: 0 })
 })
 
 test('formatStats: righe dell\'esperimento', () => {
   const stats = newStats(0)
   Object.assign(stats.experiment.banale.lowered, { turns: 4, steps: 10, output: 800, stretched: 1, aborted: 0, corrected: 1 })
   const text = formatStats(stats, [], true)
-  assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% \(5–70%\) · interrotti 0% \(0–49%\) · corretti 25% \(5–70%\)/)
+  assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% \(5–70%\) · interrotti 0% \(0–49%\) · corretti 25% \(5–70%\) · rifatti 0% \(0–49%\)/)
   assert.match(text, /semplice holdout  : 0 turni · step medi — · token out medi —/)
 })
 
@@ -471,4 +472,13 @@ test('adaptiveTimeout: configurato finché mancano misure, poi p95 con margine n
   const fast = newStats(0).classifier.durations
   for (let i = 0; i < 60; i++) addWait(fast, 5)
   assert.equal(adaptiveTimeout(fast, 1500), 300) // mai sotto il minimo
+})
+
+test('editedFile: solo gli strumenti che modificano, percorso normalizzato', () => {
+  assert.equal(editedFile({ tool: 'Edit', file_path: 'C:\\Src\\A.ts' }), 'c:/src/a.ts')
+  assert.equal(editedFile({ tool: 'Write', file_path: 'c:/src/a.ts' }), 'c:/src/a.ts')
+  assert.equal(editedFile({ tool: 'NotebookEdit', notebook_path: 'n.ipynb' }), 'n.ipynb')
+  assert.equal(editedFile({ tool: 'Read', file_path: 'a.ts' }), null)
+  assert.equal(editedFile({ tool: 'Bash', command: 'rm a.ts' }), null)
+  assert.equal(editedFile({ tool: 'Edit' }), null)
 })
