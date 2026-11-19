@@ -8,7 +8,7 @@
  */
 
 /** La versione del plugin, come in plugin.json: le statistiche si tengono anche per versione. */
-export const VERSION = '0.7.2'
+export const VERSION = '0.7.3'
 
 /** La chiave dello store con le statistiche di una versione (`stats` tiene il totale). */
 export function versionStatsKey(version: string): string {
@@ -395,12 +395,27 @@ export type Arm = 'lowered' | 'holdout'
  * Un gruppo dell'esperimento. `stretched`: turni arrivati a `escalateAfter`
  * step o a un tool fallito (per `lowered` sono i rialzi, per `holdout` quelli
  * che lo sarebbero stati); `aborted`: interrotti dall'utente; `corrected`:
- * seguiti da un prompt che corregge (isCorrection).
+ * seguiti da un prompt che corregge (isCorrection); `reworked`: turni il cui
+ * turno dopo modifica di nuovo un file che loro avevano modificato.
  */
-export type ArmStats = { turns: number; steps: number; output: number; stretched: number; aborted: number; corrected: number }
+export type ArmStats = { turns: number; steps: number; output: number; stretched: number; aborted: number; corrected: number; reworked: number }
 
 function newArm(): ArmStats {
-  return { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0 }
+  return { turns: 0, steps: 0, output: 0, stretched: 0, aborted: 0, corrected: 0, reworked: 0 }
+}
+
+// Gli strumenti che modificano un file, e il campo che lo nomina.
+const FILE_WRITERS: Record<string, string> = { Edit: 'file_path', MultiEdit: 'file_path', Write: 'file_path', NotebookEdit: 'notebook_path' }
+
+/**
+ * Il file che una chiamata a uno strumento modifica, normalizzato (barre in
+ * avanti, minuscole: su Windows `C:\A.ts` e `c:/a.ts` sono lo stesso file),
+ * o null se la chiamata non modifica file.
+ */
+export function editedFile(call: Record<string, unknown>): string | null {
+  const field = typeof call.tool === 'string' ? FILE_WRITERS[call.tool] : undefined
+  const path = field ? call[field] : undefined
+  return typeof path === 'string' && path ? path.replace(/\\/g, '/').toLowerCase() : null
 }
 
 /** I modelli verso cui un subagent può essere spostato. */
@@ -678,7 +693,7 @@ function share(k: number, n: number): string {
 const avg = (sum: number, n: number) => (n === 0 ? '—' : `${Math.round(sum / n)}`)
 
 function armLine(a: ArmStats): string {
-  return `${a.turns} turni · step medi ${a.turns ? (a.steps / a.turns).toFixed(1) : '—'} · token out medi ${avg(a.output, a.turns)} · allungati ${share(a.stretched, a.turns)} · interrotti ${share(a.aborted, a.turns)} · corretti ${share(a.corrected, a.turns)}`
+  return `${a.turns} turni · step medi ${a.turns ? (a.steps / a.turns).toFixed(1) : '—'} · token out medi ${avg(a.output, a.turns)} · allungati ${share(a.stretched, a.turns)} · interrotti ${share(a.aborted, a.turns)} · corretti ${share(a.corrected, a.turns)} · rifatti ${share(a.reworked, a.turns)}`
 }
 
 function agentArmLine(a: AgentArmStats): string {

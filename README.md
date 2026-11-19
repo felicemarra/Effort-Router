@@ -51,6 +51,7 @@ Un 10% dei turni da abbassare (`banale` o `semplice`, opzione `holdout`, da 0 a 
 - **allungati**: turni arrivati a `escalateAfter` step o a un tool fallito (per gli abbassati sono i rialzi, per l'holdout quelli che lo sarebbero stati);
 - **interrotti**: turni fermati dall'utente;
 - **corretti**: turni seguiti da un prompt che corregge la risposta (`no`, `non funziona`, `hai sbagliato`, `riprova`, `intendevo`, `volevo dire`, `doesn't work`, `I meant`, `still failing`…). Un comando slash rimanda il giudizio al prompt dopo; `/clear` (o `/new`, `/reset`) lo chiude senza correzione. È un'euristica: conta le correzioni esplicite, non quelle implicite.
+- **rifatti**: turni il cui turno successivo modifica di nuovo (Edit, MultiEdit, Write, NotebookEdit riusciti) un file che loro avevano modificato: la correzione implicita, quando l'utente non dice "no" ma il lavoro va ripreso. Conta solo il turno immediatamente dopo, e un turno una volta sola.
 
 Accanto a ogni quota c'è l'intervallo di confidenza al 95% (Wilson): con pochi turni è largo, e due gruppi si possono dire diversi solo quando i loro intervalli si separano.
 

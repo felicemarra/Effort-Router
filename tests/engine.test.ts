@@ -647,9 +647,9 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   await step($, 't1', 0)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   expect((data.get('stats') as any).turns).toEqual(101)
-  expect((data.get('stats@0.7.2') as any).turns).toEqual(1)
+  expect((data.get('stats@0.7.3') as any).turns).toEqual(1)
   const { text } = await $.command.run({ command: 'effort-router' })
-  expect(text).toContain('statistiche della versione 0.7.2')
+  expect(text).toContain('statistiche della versione 0.7.3')
   expect(text).toContain('Turni principali: 1 ')
   expect(text).toContain('101 turni · abbassati 41')
   const all = await $.command.run({ command: 'effort-router', args: 'tutto' })
@@ -657,7 +657,7 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   expect(all.text).toContain('Turni principali: 101 ')
   await $.command.run({ command: 'effort-router', args: 'reset' })
   expect((data.get('stats') as any).turns).toEqual(0)
-  expect((data.get('stats@0.7.2') as any).turns).toEqual(0)
+  expect((data.get('stats@0.7.3') as any).turns).toEqual(0)
 })
 
 test('il log "attivo" compare una volta, anche quando parte session.start', async ($, on) => {
@@ -669,7 +669,7 @@ test('il log "attivo" compare una volta, anche quando parte session.start', asyn
   memoryStore(on)
   await $.session.start({ cwd: '/progetto', surface: null, isInteractive: true })
   await $.prompt.submit({ text: LUNGO_COMPLESSO })
-  expect(logs.filter(l => l.includes('0.7.2 attivo')).length).toEqual(1)
+  expect(logs.filter(l => l.includes('0.7.3 attivo')).length).toEqual(1)
 })
 
 // Esperimento: 'h2' cade nel 10% di holdout, 't1'…'t5' no (vedi policy.unit.ts).
@@ -754,9 +754,9 @@ test('esperimento: step, token, allungati, interrotti e corretti per gruppo', { 
   await $.prompt.submit({ text: 'ok, adesso passa al file successivo per favore' })
   await step($, 't2', 0)
   await complete($, 't2')
-  const { banale } = (data.get('stats@0.7.2') as any).experiment
-  expect(banale.lowered).toEqual({ turns: 2, steps: 3, output: 300, stretched: 1, aborted: 0, corrected: 1 })
-  expect(banale.holdout).toEqual({ turns: 1, steps: 2, output: 200, stretched: 1, aborted: 1, corrected: 0 })
+  const { banale } = (data.get('stats@0.7.3') as any).experiment
+  expect(banale.lowered).toEqual({ turns: 2, steps: 3, output: 300, stretched: 1, aborted: 0, corrected: 1, reworked: 0 })
+  expect(banale.holdout).toEqual({ turns: 1, steps: 2, output: 200, stretched: 1, aborted: 1, corrected: 0, reworked: 0 })
 })
 
 test('esperimento: turni complessi e difficili restano fuori', async ($, on) => {
@@ -964,4 +964,38 @@ test('salvataggio: al più uno ogni saveEveryMs, il primo subito', async ($, on)
   // Il resoconto conta anche quello che non è ancora salvato.
   const { text } = await $.command.run({ command: 'effort-router' })
   expect(text).toContain('Turni principali: 2')
+})
+
+test('esperimento: un turno il cui turno dopo rimodifica gli stessi file è rifatto', { options: { saveEveryMs: 0 } }, async ($, on) => {
+  on('model.complete', async () => ({ value: { isAnswered: true, text: 'banale', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.step', async function* ($: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  on('tool.call', async () => ({ result: 'ok', text: 'ok' }))
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  const data = memoryStore(on)
+  const edit = (file_path: string) => $.tool.call({ tool: 'Edit', file_path, old_string: 'a', new_string: 'b' })
+  // t1 modifica a.ts; t2 lo rimodifica (scritto diverso): t1 rifatto, una volta sola.
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await edit('C:\\src\\a.ts')
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't2', 0)
+  await edit('c:/src/A.ts')
+  await edit('c:/src/a.ts')
+  // t3 modifica un altro file: t2 non è rifatto.
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't3', 0)
+  await edit('c:/src/b.ts')
+  // t4 rimodifica a.ts, ma t3 non l'aveva toccato e t2 non è più il turno prima.
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't4', 0)
+  await edit('c:/src/a.ts')
+  await complete($, 't4')
+  const { banale } = (data.get('stats') as any).experiment
+  expect(banale.lowered.turns).toEqual(4)
+  expect(banale.lowered.reworked).toEqual(1)
 })
