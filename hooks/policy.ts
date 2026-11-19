@@ -8,7 +8,7 @@
  */
 
 /** La versione del plugin, come in plugin.json: le statistiche si tengono anche per versione. */
-export const VERSION = '0.7.1'
+export const VERSION = '0.7.2'
 
 /** La chiave dello store con le statistiche di una versione (`stats` tiene il totale). */
 export function versionStatsKey(version: string): string {
@@ -280,6 +280,9 @@ export type Stats = {
   labels: Record<Label, number>
   // `failed`: nessuna label (timeout, errore, risposta non valida); `ms`: attesa totale.
   classifier: { calls: number; input: number; output: number; failed: number; ms: number }
+  // Quanto il primo step dei turni classificati da Haiku aspetta la label:
+  // la latenza che il plugin aggiunge davvero (la chiamata parte insieme al turno).
+  firstStepWait: Wait
   // `skipped`: subagent non classificati perché nessuna label cambierebbe nulla.
   subagents: { classified: number; skipped: number; toHaiku: number; toSonnet: number; lowered: number; raised: number; labels: Record<Label, number> }
   cache: Cache
@@ -287,6 +290,47 @@ export type Stats = {
 
 /** Le richieste con l'effort invariato e con l'effort cambiato. */
 export type Cache = { same: CacheBucket; changed: CacheBucket }
+
+// --- Attesa del primo step ------------------------------------------------
+
+/** I limiti superiori (ms) delle fasce dell'attesa; oltre l'ultimo, `over`. */
+export const WAIT_BOUNDS = [10, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 8000] as const
+
+/** Attese contate, la loro somma e quante per fascia (`le<ms>`, `over`): si sommano tra sessioni. */
+export type Wait = { turns: number; ms: number; buckets: Record<string, number> }
+
+function newWait(): Wait {
+  return { turns: 0, ms: 0, buckets: Object.fromEntries([...WAIT_BOUNDS.map(bound => [`le${bound}`, 0]), ['over', 0]]) }
+}
+
+export function addWait(wait: Wait, ms: number): void {
+  const bound = WAIT_BOUNDS.find(b => ms <= b)
+  wait.turns++
+  wait.ms += ms
+  wait.buckets[bound === undefined ? 'over' : `le${bound}`]++
+}
+
+/**
+ * Il limite superiore della fascia che contiene il percentile `p` (0-1), o
+ * null senza attese; Infinity se cade oltre l'ultima fascia.
+ */
+export function waitPercentile(wait: Wait, p: number): number | null {
+  if (wait.turns === 0) return null
+  let seen = 0
+  for (const bound of WAIT_BOUNDS) {
+    seen += wait.buckets[`le${bound}`]
+    if (seen >= p * wait.turns) return bound
+  }
+  return Infinity
+}
+
+function waitLine(wait: Wait): string {
+  const at = (p: number) => {
+    const bound = waitPercentile(wait, p)
+    return bound === null ? '—' : bound === Infinity ? `> ${WAIT_BOUNDS.at(-1)} ms` : `≤ ${bound} ms`
+  }
+  return `${wait.turns} turni · media ${wait.turns ? `${Math.round(wait.ms / wait.turns)} ms` : '—'} · p50 ${at(0.5)} · p95 ${at(0.95)}`
+}
 
 // --- Esperimento -----------------------------------------------------------
 
@@ -387,6 +431,7 @@ export function newStats(now: number): Stats {
     },
     labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 },
     classifier: { calls: 0, input: 0, output: 0, failed: 0, ms: 0 },
+    firstStepWait: newWait(),
     subagents: { classified: 0, skipped: 0, toHaiku: 0, toSonnet: 0, lowered: 0, raised: 0, labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 } },
     cache: { same: { n: 0, read: 0, total: 0 }, changed: { n: 0, read: 0, total: 0 } },
   }
@@ -524,7 +569,8 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     `Turni principali: ${stats.turns} · abbassati ${stats.lowered} (${pct(stats.lowered, stats.turns)}) · alzati ${stats.raised} (${pct(stats.raised, stats.turns)}) · ereditati ${stats.inherited} · rialzati a metà ${stats.escalated} · sotto protezione cache ${stats.guarded}`,
     `Label: ${labelCounts(stats.labels)} · di cui difficili per ultrathink ${stats.deepThinking}`,
     `Rialzati a metà per label: banale ${stats.escalatedBy.banale} (${pct(stats.escalatedBy.banale, stats.labels.banale)}) · semplice ${stats.escalatedBy.semplice} (${pct(stats.escalatedBy.semplice, stats.labels.semplice)}) · per errore di un tool ${stats.escalatedOnError}`,
-    `Classificatore Haiku: ${stats.classifier.calls} chiamate · ${stats.classifier.input} token in · ${stats.classifier.output} token out · senza label ${stats.classifier.failed} (${pct(stats.classifier.failed, stats.classifier.calls)}) · attesa media ${stats.classifier.calls ? `${Math.round(stats.classifier.ms / stats.classifier.calls)} ms` : '—'}`,
+    `Classificatore Haiku: ${stats.classifier.calls} chiamate · ${stats.classifier.input} token in · ${stats.classifier.output} token out · senza label ${stats.classifier.failed} (${pct(stats.classifier.failed, stats.classifier.calls)}) · durata media ${stats.classifier.calls ? `${Math.round(stats.classifier.ms / stats.classifier.calls)} ms` : '—'}`,
+    `Attesa del primo step per la label: ${waitLine(stats.firstStepWait)}`,
     `Subagent: classificati ${stats.subagents.classified} · saltati perché nulla cambierebbe ${stats.subagents.skipped} · su Haiku ${stats.subagents.toHaiku} · su Sonnet ${stats.subagents.toSonnet} · effort abbassato ${stats.subagents.lowered} · alzato ${stats.subagents.raised}`,
     `Label dei subagent: ${labelCounts(stats.subagents.labels)}`,
     '',

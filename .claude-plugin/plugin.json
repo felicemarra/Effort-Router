@@ -1,6 +1,6 @@
 {
   "name": "effort-router",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Abbassa il reasoning effort sui turni semplici e lo alza oltre il default (xhigh o max) su quelli difficili; ogni turno riparte dal default (high). I subagent banali vanno su Haiku, i semplici su Sonnet. Classifica con il modello piccolo di Claude Code, nessun servizio di terzi. Non cambia mai il modello del turno principale (la cache resta valida).",
   "author": {
     "name": "Felice Marra"

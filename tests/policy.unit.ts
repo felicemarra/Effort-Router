@@ -8,11 +8,13 @@ import {
   pickArm,
   turnFraction,
   classifyPrompt,
+  addWait,
   cacheVerdict,
   mergeCacheDays,
   readCacheDays,
   subagentCanChange,
   sumCacheDays,
+  waitPercentile,
   canChange,
   canRouteSubagent,
   clip,
@@ -269,7 +271,7 @@ test('formatStats: rialzi per label, classificatore e label dei subagent', () =>
   const text = formatStats(stats, [], true)
   assert.match(text, /Rialzati a metà per label: banale 2 \(20%\) · semplice 0 \(—\) · per errore di un tool 1/)
   assert.match(text, /di cui difficili per ultrathink 5/)
-  assert.match(text, /senza label 1 \(25%\) · attesa media 500 ms/)
+  assert.match(text, /senza label 1 \(25%\) · durata media 500 ms/)
   assert.match(text, /Label dei subagent: banale 0 · semplice 0 · complesso 0 · difficile 3/)
 })
 
@@ -407,4 +409,18 @@ test('subagentCanChange: modello libero o effort che una label sposterebbe', () 
   assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'low', null), false)
   assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'low', 'xhigh'), false)
   assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'high', 'xhigh'), true)
+})
+
+test('attesa del primo step: fasce, percentili e resoconto', () => {
+  const stats = newStats(0)
+  assert.equal(waitPercentile(stats.firstStepWait, 0.95), null)
+  for (const ms of [0, 5, 40, 80, 120, 180, 250, 400, 900, 1400]) addWait(stats.firstStepWait, ms)
+  assert.equal(waitPercentile(stats.firstStepWait, 0.5), 200)
+  assert.equal(waitPercentile(stats.firstStepWait, 0.95), 1500)
+  addWait(stats.firstStepWait, 9000)
+  assert.equal(stats.firstStepWait.buckets.over, 1)
+  assert.equal(waitPercentile(stats.firstStepWait, 1), Infinity)
+  assert.match(formatStats(stats, [], true), /Attesa del primo step per la label: 11 turni · media 1125 ms · p50 ≤ 200 ms · p95 > 8000 ms/)
+  assert.match(formatStats(newStats(0), [], true), /Attesa del primo step per la label: 0 turni · media — · p50 — · p95 —/)
+  assert.equal(readStats({ turns: 1 }, 0).firstStepWait.buckets.le1000, 0)
 })

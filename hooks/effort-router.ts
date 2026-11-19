@@ -28,6 +28,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import {
   addUsage,
+  addWait,
   asksDeepThinking,
   CACHE_GAP_MS,
   cacheVerdict,
@@ -273,6 +274,8 @@ export const register: Register = (on, options) => {
   // Una sola classificazione in attesa: i turni principali sono sequenziali.
   let pending: Promise<Label | null> | null = null
   let pendingInherited = false
+  // Se `pending` è una chiamata a Haiku (non una label ereditata o da ultrathink).
+  let pendingClassified = false
   // La label del turno principale precedente, per i seguiti brevissimi.
   let last: { label: Label | null; inherited: boolean } = { label: null, inherited: false }
   let appliedTurnId: string | undefined
@@ -340,6 +343,7 @@ export const register: Register = (on, options) => {
     }
     pending = null
     pendingInherited = false
+    pendingClassified = false
     if (await guarded($, st, cacheGuard)) return next(e)
 
     // `ultrathink` e simili: l'utente ha già deciso, Haiku non serve.
@@ -369,6 +373,7 @@ export const register: Register = (on, options) => {
       return kept
     })
     pending = classifying
+    pendingClassified = true
     // Il turno parte subito; il primo turn.step aspetta la label. L'hook resta
     // vivo finché la classificazione non finisce, così la chiamata non è
     // abbandonata con il dispatch.
@@ -455,9 +460,13 @@ export const register: Register = (on, options) => {
       sessionEffort = e.effort
       const waiting = pending
       const inherited = pendingInherited
+      const classified = waiting !== null && pendingClassified
       pending = null
       pendingInherited = false
+      pendingClassified = false
+      const waitStart = classified ? await clockNow($) : 0
       const label = waiting ? await waiting : null
+      if (classified) addWait(s.firstStepWait, Math.max(0, (await clockNow($)) - waitStart))
       const guard = await guarded($, st, cacheGuard)
       applied = guard ? null : decideEffort(label, e.effort, raiseTo)
       lowered = isLowered(applied, e.effort)

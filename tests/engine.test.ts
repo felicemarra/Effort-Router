@@ -647,9 +647,9 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   await step($, 't1', 0)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   expect((data.get('stats') as any).turns).toEqual(101)
-  expect((data.get('stats@0.7.1') as any).turns).toEqual(1)
+  expect((data.get('stats@0.7.2') as any).turns).toEqual(1)
   const { text } = await $.command.run({ command: 'effort-router' })
-  expect(text).toContain('statistiche della versione 0.7.1')
+  expect(text).toContain('statistiche della versione 0.7.2')
   expect(text).toContain('Turni principali: 1 ')
   expect(text).toContain('101 turni · abbassati 41')
   const all = await $.command.run({ command: 'effort-router', args: 'tutto' })
@@ -657,7 +657,7 @@ test('statistiche salvate anche per versione; /effort-router tutto mostra il tot
   expect(all.text).toContain('Turni principali: 101 ')
   await $.command.run({ command: 'effort-router', args: 'reset' })
   expect((data.get('stats') as any).turns).toEqual(0)
-  expect((data.get('stats@0.7.1') as any).turns).toEqual(0)
+  expect((data.get('stats@0.7.2') as any).turns).toEqual(0)
 })
 
 test('il log "attivo" compare una volta, anche quando parte session.start', async ($, on) => {
@@ -669,7 +669,7 @@ test('il log "attivo" compare una volta, anche quando parte session.start', asyn
   memoryStore(on)
   await $.session.start({ cwd: '/progetto', surface: null, isInteractive: true })
   await $.prompt.submit({ text: LUNGO_COMPLESSO })
-  expect(logs.filter(l => l.includes('0.7.1 attivo')).length).toEqual(1)
+  expect(logs.filter(l => l.includes('0.7.2 attivo')).length).toEqual(1)
 })
 
 // Esperimento: 'h2' cade nel 10% di holdout, 't1'…'t5' no (vedi policy.unit.ts).
@@ -754,7 +754,7 @@ test('esperimento: step, token, allungati, interrotti e corretti per gruppo', as
   await $.prompt.submit({ text: 'ok, adesso passa al file successivo per favore' })
   await step($, 't2', 0)
   await complete($, 't2')
-  const { banale } = (data.get('stats@0.7.1') as any).experiment
+  const { banale } = (data.get('stats@0.7.2') as any).experiment
   expect(banale.lowered).toEqual({ turns: 2, steps: 3, output: 300, stretched: 1, aborted: 0, corrected: 1 })
   expect(banale.holdout).toEqual({ turns: 1, steps: 2, output: 200, stretched: 1, aborted: 1, corrected: 0 })
 })
@@ -804,4 +804,23 @@ test('esperimento subagent: spostato su haiku contro holdout sul modello del pad
   expect(x.haiku.holdout).toEqual({ agents: 1, steps: 1, output: 50, stretched: 0, aborted: 1 })
   expect(x.sonnet.lowered.agents + x.sonnet.holdout.agents).toEqual(0)
   expect(subagents.toHaiku).toEqual(1)
+})
+
+test('attesa del primo step: misurata sui turni classificati, non su quelli ereditati', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  const data = memoryStore(on)
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  // Ogni lettura dell'orologio avanza di 100 ms.
+  let now = 0
+  on('clock.now', async () => ({ value: (now += 100) }))
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: 'ok' }) // ereditata: nessuna attesa da misurare
+  await step($, 't2', 0)
+  await complete($, 't2')
+  const { firstStepWait } = data.get('stats') as any
+  expect(firstStepWait.turns).toEqual(1)
+  expect(firstStepWait.ms).toEqual(100)
+  expect(firstStepWait.buckets.le100).toEqual(1)
 })
