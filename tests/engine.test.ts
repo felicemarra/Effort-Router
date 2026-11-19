@@ -692,7 +692,7 @@ test('holdout 0: nessun turno lasciato com era', { options: { holdout: 0 } }, as
   expect(seen).toEqual(['low'])
 })
 
-test('holdout anche su un turno ereditato: resta all effort della sessione', async ($, on) => {
+test('holdout anche su un turno ereditato: resta all effort della sessione', { options: { saveEveryMs: 0 } }, async ($, on) => {
   const seen: unknown[] = []
   const calls = { n: 0 }
   const status: unknown[] = []
@@ -736,7 +736,7 @@ async function complete($: any, turnId: string, isAborted = false) {
   await $.turn.complete({ answer: '', durationMs: 1, isAborted, turnId, reason: isAborted ? 'aborted' : 'answer' })
 }
 
-test('esperimento: step, token, allungati, interrotti e corretti per gruppo', async ($, on) => {
+test('esperimento: step, token, allungati, interrotti e corretti per gruppo', { options: { saveEveryMs: 0 } }, async ($, on) => {
   const data = experimentBottom(on, 'banale')
   // Abbassato: un tool fallisce, il turno si allunga; poi l'utente corregge.
   await $.prompt.submit({ text: LUNGO_BANALE })
@@ -823,4 +823,145 @@ test('attesa del primo step: misurata sui turni classificati, non su quelli ered
   expect(firstStepWait.turns).toEqual(1)
   expect(firstStepWait.ms).toEqual(100)
   expect(firstStepWait.buckets.le100).toEqual(1)
+})
+
+// Un verdetto della cache `ok` nella finestra: serve a `labelWaitMs`.
+const CACHE_OK = { same: { n: 20, read: 900, total: 1000 }, changed: { n: 20, read: 880, total: 1000 } }
+
+test('labelWaitMs con la cache verificata: primo step senza attesa, label dallo step dopo', { options: { labelWaitMs: 50 } }, async ($, on) => {
+  const seen: unknown[] = []
+  let called!: () => void
+  const classifying = new Promise<void>(resolve => (called = resolve))
+  on('model.complete', async () => {
+    called()
+    await new Promise(resolve => setTimeout(resolve, 40))
+    return { value: { isAnswered: true, text: 'banale', usage: USAGE } }
+  })
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.step', async function* ($: any, e: any) {
+    seen.push(e.effort)
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  on('clock.now', async () => ({ value: NOW }))
+  on('clock.sleep', async () => ({ value: undefined })) // il budget scade subito
+  const data = memoryStore(on, { cacheDays: { '2026-11-19': CACHE_OK } })
+  // Il prompt.submit resta vivo finché Haiku risponde: il turno parte prima.
+  const submitted = $.prompt.submit({ text: LUNGO_BANALE })
+  await classifying
+  await step($, 't1', 0)
+  await submitted
+  await step($, 't1', 1)
+  await complete($, 't1')
+  expect(seen).toEqual(['high', 'low'])
+  const stats = data.get('stats') as any
+  expect(stats.lateLabel).toEqual(1)
+  expect(stats.lowered).toEqual(1)
+  // Fuori dall'esperimento: il primo step non è stato abbassato.
+  expect(stats.experiment.banale.lowered.turns + stats.experiment.banale.holdout.turns).toEqual(0)
+})
+
+test('labelWaitMs senza cache verificata: il primo step aspetta la label', { options: { labelWaitMs: 50 } }, async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  on('clock.sleep', async () => ({ value: undefined }))
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  expect(seen).toEqual(['low'])
+})
+
+test('subagent abbassato: un tool fallito lo riporta all effort di partenza', async ($, on) => {
+  const seen: unknown[] = []
+  on('model.complete', async () => ({ value: { isAnswered: true, text: 'semplice', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('turn.step', async function* ($: any, e: any) {
+    seen.push(e.effort)
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  on('tool.call', async () => ({ result: 'exit 1', text: 'exit 1', isError: true }))
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  on('agent.spawn', async ($: any, e: any) => ({ model: e.model ?? e.parentModel, agentId: 'a1' }))
+  const data = memoryStore(on)
+  // Modello esplicito: resta su sonnet, ma l'effort scende a medium.
+  await spawnCall($, { model: 'sonnet' })
+  for (const index of [0, 1, 2]) {
+    if (index === 1) await bash($, 'a1')
+    for await (const _ of $.turn.step({ turnId: 's1', index, model: 'sonnet', effort: 'high', messageCount: 1, agentId: 'a1' })) void _
+  }
+  expect(seen).toEqual(['medium', 'high', 'high'])
+  await complete($, 't1')
+  expect((data.get('stats') as any).subagents.escalated).toEqual(1)
+})
+
+test('classificatore: criteri dei subagent per gli spawn, inizio e fine dei prompt lunghi', { options: { raiseTo: 'xhigh' } }, async ($, on) => {
+  const calls: any[] = []
+  on('model.complete', async ($: any, e: any) => (calls.push(e), { value: { isAnswered: true, text: 'complesso', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.step', async function* ($: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  on('agent.spawn', async ($: any, e: any) => ({ model: e.model ?? e.parentModel, agentId: 'a1' }))
+  await $.prompt.submit({ text: `${'log '.repeat(1000)}\nperché fallisce?` })
+  await step($, 't1', 0)
+  await spawnCall($)
+  expect(calls[0].prompt).toContain('perché fallisce?')
+  expect(calls[0].prompt.length < 1700).toEqual(true)
+  expect(calls[0].system).toContain("un assistente di programmazione.")
+  expect(calls[1].system).toContain('sotto-agente')
+})
+
+test('giudizio del turno: un comando slash lo rimanda, /clear lo chiude', { options: { saveEveryMs: 0 } }, async ($, on) => {
+  const data = experimentBottom(on, 'banale')
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: '/help' })
+  await $.prompt.submit({ text: 'no, non funziona' })
+  await step($, 't2', 0)
+  await complete($, 't2')
+  expect((data.get('stats') as any).experiment.banale.lowered.corrected).toEqual(1)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't3', 0)
+  await $.prompt.submit({ text: '/clear' })
+  await $.prompt.submit({ text: 'no, non funziona' })
+  await step($, 't4', 0)
+  await complete($, 't4')
+  expect((data.get('stats') as any).experiment.banale.lowered.corrected).toEqual(1)
+})
+
+test('timeout adattivo: con abbastanza misure scende al p95 con margine', async ($, on) => {
+  const timeouts: unknown[] = []
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('model.complete', async ($: any, e: any) => (timeouts.push(e.timeoutMs), { value: { isAnswered: true, text: 'banale', usage: USAGE } }))
+  const buckets: Record<string, number> = { le500: 60 }
+  memoryStore(on, { stats: { classifier: { calls: 60, durations: { turns: 60, ms: 24000, buckets } } } })
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  expect(timeouts).toEqual([750])
+  const { text } = await $.command.run({ command: 'effort-router' })
+  expect(text).toContain('Timeout del classificatore: 750 ms (adattivo; configurato 1500 ms)')
+})
+
+test('salvataggio: al più uno ogni saveEveryMs, il primo subito', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  on('clock.now', async () => ({ value: NOW }))
+  const data = memoryStore(on)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  await complete($, 't1')
+  expect((data.get('stats') as any).turns).toEqual(1)
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't2', 0)
+  await complete($, 't2')
+  expect((data.get('stats') as any).turns).toEqual(1)
+  // Il resoconto conta anche quello che non è ancora salvato.
+  const { text } = await $.command.run({ command: 'effort-router' })
+  expect(text).toContain('Turni principali: 2')
 })

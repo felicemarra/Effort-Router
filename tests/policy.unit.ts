@@ -4,17 +4,21 @@ import {
   addUsage,
   asksDeepThinking,
   isCorrection,
+  judgePrompt,
   parseHoldout,
   pickArm,
   turnFraction,
   classifyPrompt,
+  adaptiveTimeout,
   addWait,
   cacheVerdict,
+  clipEnds,
   mergeCacheDays,
   readCacheDays,
   subagentCanChange,
   sumCacheDays,
   waitPercentile,
+  wilson,
   canChange,
   canRouteSubagent,
   clip,
@@ -378,7 +382,7 @@ test('formatStats: righe dell\'esperimento', () => {
   const stats = newStats(0)
   Object.assign(stats.experiment.banale.lowered, { turns: 4, steps: 10, output: 800, stretched: 1, aborted: 0, corrected: 1 })
   const text = formatStats(stats, [], true)
-  assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0% · corretti 25%/)
+  assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% \(5–70%\) · interrotti 0% \(0–49%\) · corretti 25% \(5–70%\)/)
   assert.match(text, /semplice holdout  : 0 turni · step medi — · token out medi —/)
 })
 
@@ -387,7 +391,7 @@ test('esperimento subagent: store vecchio a zero, righe nel resoconto', () => {
   const stats = newStats(0)
   Object.assign(stats.subagentExperiment.haiku.lowered, { agents: 4, steps: 10, output: 800, stretched: 1, aborted: 0 })
   const text = formatStats(stats, [], true)
-  assert.match(text, /haiku spostati: 4 subagent · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0%/)
+  assert.match(text, /haiku spostati: 4 subagent · step medi 2\.5 · token out medi 200 · allungati 25% \(5–70%\) · interrotti 0% \(0–49%\)/)
   assert.match(text, /sonnet holdout : 0 subagent · step medi —/)
 })
 
@@ -423,4 +427,48 @@ test('attesa del primo step: fasce, percentili e resoconto', () => {
   assert.match(formatStats(stats, [], true), /Attesa del primo step per la label: 11 turni · media 1125 ms · p50 ≤ 200 ms · p95 > 8000 ms/)
   assert.match(formatStats(newStats(0), [], true), /Attesa del primo step per la label: 0 turni · media — · p50 — · p95 —/)
   assert.equal(readStats({ turns: 1 }, 0).firstStepWait.buckets.le1000, 0)
+})
+
+test('wilson: intervallo al 95%, null senza campioni', () => {
+  assert.equal(wilson(0, 0), null)
+  const [lo, hi] = wilson(1, 4)!
+  assert.ok(Math.abs(lo - 0.0456) < 0.001 && Math.abs(hi - 0.6994) < 0.001, `${lo} ${hi}`)
+  const [lo2, hi2] = wilson(50, 100)!
+  assert.ok(lo2 > 0.40 && hi2 < 0.60)
+})
+
+test('clipEnds: inizio e fine di un testo lungo', () => {
+  assert.equal(clipEnds('abc', 2, 2), 'abc')
+  assert.equal(clipEnds('0123456789', 3, 2), '012\n[…]\n89')
+  const long = `${'a'.repeat(3000)}FINE`
+  assert.ok(clipEnds(long).endsWith('FINE'))
+  assert.ok(clipEnds(long).length < 1600)
+})
+
+test('judgePrompt: comandi slash rimandano, quelli che azzerano chiudono', () => {
+  assert.equal(judgePrompt('no, non funziona'), 'corrected')
+  assert.equal(judgePrompt('ora aggiungi i test'), 'clean')
+  assert.equal(judgePrompt('/help'), 'wait')
+  assert.equal(judgePrompt('/clear'), 'clean')
+  assert.equal(judgePrompt('/new'), 'clean')
+  for (const text of ['intendevo il file di test', 'volevo dire la seconda', 'I meant the other one', "that's not what I meant"])
+    assert.equal(isCorrection(text), true, text)
+})
+
+test('adaptiveTimeout: configurato finché mancano misure, poi p95 con margine nei limiti', () => {
+  const stats = newStats(0)
+  const d = stats.classifier.durations
+  for (let i = 0; i < 49; i++) addWait(d, 180)
+  assert.equal(adaptiveTimeout(d, 1500), 1500)
+  addWait(d, 180)
+  assert.equal(adaptiveTimeout(d, 1500), 300) // p95 ≤ 200 · 1.5
+  for (let i = 0; i < 100; i++) addWait(d, 450)
+  assert.equal(adaptiveTimeout(d, 1500), 750)
+  assert.equal(adaptiveTimeout(d, 600), 600) // mai sopra il configurato
+  const slow = newStats(0).classifier.durations
+  for (let i = 0; i < 60; i++) addWait(slow, 9000)
+  assert.equal(adaptiveTimeout(slow, 1500), 1500)
+  const fast = newStats(0).classifier.durations
+  for (let i = 0; i < 60; i++) addWait(fast, 5)
+  assert.equal(adaptiveTimeout(fast, 1500), 300) // mai sotto il minimo
 })
