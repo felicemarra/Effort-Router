@@ -9,6 +9,10 @@ import {
   turnFraction,
   classifyPrompt,
   cacheVerdict,
+  mergeCacheDays,
+  readCacheDays,
+  subagentCanChange,
+  sumCacheDays,
   canChange,
   canRouteSubagent,
   clip,
@@ -374,4 +378,33 @@ test('formatStats: righe dell\'esperimento', () => {
   const text = formatStats(stats, [], true)
   assert.match(text, /banale abbassati: 4 turni · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0% · corretti 25%/)
   assert.match(text, /semplice holdout  : 0 turni · step medi — · token out medi —/)
+})
+
+test('esperimento subagent: store vecchio a zero, righe nel resoconto', () => {
+  assert.deepEqual(readStats({ turns: 9 }, 0).subagentExperiment.sonnet.holdout, { agents: 0, steps: 0, output: 0, stretched: 0, aborted: 0 })
+  const stats = newStats(0)
+  Object.assign(stats.subagentExperiment.haiku.lowered, { agents: 4, steps: 10, output: 800, stretched: 1, aborted: 0 })
+  const text = formatStats(stats, [], true)
+  assert.match(text, /haiku spostati: 4 subagent · step medi 2\.5 · token out medi 200 · allungati 25% · interrotti 0%/)
+  assert.match(text, /sonnet holdout : 0 subagent · step medi —/)
+})
+
+test('cache per giorno: finestra di 14 giorni, chiavi malformate scartate, somma', () => {
+  const now = Date.UTC(2026, 10, 19, 23)
+  const one = { same: { n: 1, read: 9, total: 10 }, changed: { n: 0, read: 0, total: 0 } }
+  const saved = readCacheDays({ '2026-11-05': one, '2026-11-06': one, 'stats': one, '2026-11-19': { same: { n: 'x' } } })
+  assert.deepEqual(Object.keys(saved).sort(), ['2026-11-05', '2026-11-06', '2026-11-19'])
+  const merged = mergeCacheDays(saved, { '2026-11-19': one }, now)
+  assert.deepEqual(Object.keys(merged).sort(), ['2026-11-06', '2026-11-19'])
+  assert.deepEqual(sumCacheDays(merged).same, { n: 2, read: 18, total: 20 })
+  assert.deepEqual(readCacheDays([1]), {})
+})
+
+test('subagentCanChange: modello libero o effort che una label sposterebbe', () => {
+  const spawn = { fork: false, parentModel: 'claude-opus-5-5' }
+  assert.equal(subagentCanChange(spawn, 'low', null), true)
+  assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'high', null), true)
+  assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'low', null), false)
+  assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'low', 'xhigh'), false)
+  assert.equal(subagentCanChange({ ...spawn, model: 'sonnet' }, 'high', 'xhigh'), true)
 })

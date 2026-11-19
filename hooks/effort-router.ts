@@ -35,6 +35,7 @@ import {
   canRouteSubagent,
   classifyPrompt,
   clip,
+  day,
   decideEffort,
   decideSubagentEffort,
   decideSubagentModel,
@@ -48,27 +49,38 @@ import {
   isFastModel,
   isLowered,
   longPromptLabel,
+  mergeCacheDays,
   MID_SUBAGENT_MODEL,
   mergeStats,
+  newCache,
   newStats,
   parseHoldout,
   parseLabel,
   parseRaise,
   pickArm,
+  readCacheDays,
   readStats,
   shouldClassify,
   shouldEscalate,
+  subagentCanChange,
   subagentWorthClassifying,
+  sumCacheDays,
   SYSTEM,
   turnFraction,
   VERSION,
   versionStatsKey,
 } from './policy.ts'
-import type { Arm, Effort, Label, Stats, TestedLabel } from './policy.ts'
+import type { Arm, Cache, CacheDays, Effort, Label, RoutedModel, Stats, TestedLabel } from './policy.ts'
 
 const COMMAND = 'effort-router'
 // Quanti subagent ricordare per applicarne l'effort: i più vecchi escono.
 const MAX_TRACKED_AGENTS = 200
+
+// Ricorda un subagent in corsa; oltre MAX_TRACKED_AGENTS esce il più vecchio.
+function remember<T>(map: Map<string, T>, agentId: string, value: T): void {
+  map.set(agentId, value)
+  if (map.size > MAX_TRACKED_AGENTS) map.delete(map.keys().next().value!)
+}
 
 // Lo stato che gli helper qui sotto condividono con gli hook: uno per caricamento.
 type State = {
@@ -78,6 +90,9 @@ type State = {
   saved: Stats | null
   savedVersion: Stats | null
   delta: Stats
+  // Le misure della cache per giorno, salvate e di questa sessione, per il verdetto.
+  cacheDays: CacheDays | null
+  cacheDelta: CacheDays
   statsDirty: boolean
   fastTypes: Set<string> | null
   started: boolean
@@ -134,11 +149,23 @@ async function getStats($: EngineInterface, st: State, onlyVersion = false): Pro
   return mergeStats(st.saved, st.delta)
 }
 
+// Le misure della cache degli ultimi CACHE_WINDOW_DAYS giorni, salvate più quelle di questa sessione.
+async function getRecentCache($: EngineInterface, st: State): Promise<Cache> {
+  st.cacheDays ??= readCacheDays(await load($, 'cacheDays'))
+  return sumCacheDays(mergeCacheDays(st.cacheDays, st.cacheDelta, await clockNow($)))
+}
+
 // Rilegge lo store e ci somma gli incrementi: le altre sessioni non si perdono.
 async function saveStats($: EngineInterface, st: State): Promise<void> {
   if (!st.statsDirty) return
   st.statsDirty = false
   const now = await clockNow($)
+  if (Object.keys(st.cacheDelta).length) {
+    const days = mergeCacheDays(readCacheDays(await load($, 'cacheDays')), st.cacheDelta, now)
+    st.cacheDelta = {}
+    st.cacheDays = days
+    await save($, 'cacheDays', days)
+  }
   const merged = mergeStats(readStats(await load($, 'stats'), now), st.delta)
   const mergedVersion = mergeStats(readStats(await load($, VERSION_KEY), now), st.delta)
   st.delta = newStats(0)
@@ -169,7 +196,7 @@ async function setFastType($: EngineInterface, st: State, type: string, isFast: 
 
 // Se la protezione della cache è scattata; lo dice una volta.
 async function guarded($: EngineInterface, st: State, cacheGuard: boolean): Promise<boolean> {
-  if (!cacheGuard || cacheVerdict(await getStats($, st)) !== 'busting') return false
+  if (!cacheGuard || cacheVerdict({ cache: await getRecentCache($, st) }) !== 'busting') return false
   if (!st.guardAnnounced) {
     st.guardAnnounced = true
     $.ui.log("[effort-router] cambiare effort invalida la prompt cache: sul turno principale l'effort non viene più cambiato (/effort-router)")
@@ -241,7 +268,7 @@ export const register: Register = (on, options) => {
   // Lo stesso per i subagent: di default non si alza.
   const subagentRaiseTo = parseRaise(options.subagentRaiseTo, DEFAULT_SUBAGENT_RAISE)
 
-  const st: State = { saved: null, savedVersion: null, delta: newStats(0), statsDirty: false, fastTypes: null, started: false, guardAnnounced: false }
+  const st: State = { saved: null, savedVersion: null, delta: newStats(0), cacheDays: null, cacheDelta: {}, statsDirty: false, fastTypes: null, started: false, guardAnnounced: false }
   const announce = log ? `[effort-router] ${VERSION} attivo: abbassa l'effort sui turni semplici${raiseTo ? `, lo alza a ${raiseTo} su quelli difficili` : ''}` : null
   // Una sola classificazione in attesa: i turni principali sono sequenziali.
   let pending: Promise<Label | null> | null = null
@@ -266,6 +293,8 @@ export const register: Register = (on, options) => {
   let lastSent: { effort: unknown; model: string; at: number } | null = null
   // Label dei subagent in corsa, per l'effort dei loro step.
   const agentLabels = new Map<string, Label>()
+  // Il gruppo dell'esperimento dei subagent in corsa da spostare su Haiku o Sonnet.
+  const agentExperiments = new Map<string, { model: RoutedModel; arm: Arm; stretched: boolean; toolFailed: boolean }>()
 
   on('session.start', async ($, e, next) => {
     await start($, st, announce)
@@ -285,12 +314,16 @@ export const register: Register = (on, options) => {
       await save($, VERSION_KEY, st.savedVersion)
       st.fastTypes = new Set()
       await save($, 'fastTypes', [])
+      st.cacheDays = {}
+      st.cacheDelta = {}
+      await save($, 'cacheDays', {})
       return { text: 'effort-router: statistiche e tipi di subagent azzerati.' }
     }
     const fastTypes = [...(await getFastTypes($, st))]
     const total = await getStats($, st)
-    if (arg === 'tutto') return { text: formatStats(total, fastTypes, cacheGuard) }
-    return { text: formatStats(await getStats($, st, true), fastTypes, cacheGuard, VERSION, total) }
+    const recent = await getRecentCache($, st)
+    if (arg === 'tutto') return { text: formatStats(total, fastTypes, cacheGuard, null, null, recent) }
+    return { text: formatStats(await getStats($, st, true), fastTypes, cacheGuard, VERSION, total, recent) }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -353,23 +386,36 @@ export const register: Register = (on, options) => {
     const knownFast = canRouteSubagent(e) && fast.has(e.subagentType)
     let label: Label | null = null
     let model: string | null = null
-    if (routeSubagents && subagentWorthClassifying(e, knownFast)) {
+    let tested: { model: RoutedModel; arm: Arm } | null = null
+    const worth = routeSubagents && subagentWorthClassifying(e, knownFast)
+    // Modello scelto nella chiamata ed effort che nessuna label sposterebbe: Haiku non serve.
+    if (worth && !subagentCanChange(e, sessionEffort, subagentRaiseTo)) {
+      st.delta.subagents.skipped++
+      st.statsDirty = true
+      if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): non classificato, nessuna label cambierebbe modello o effort`)
+    } else if (worth) {
       const classified = await classify($, st, clip(`${e.description}\n\n${e.prompt}`), timeoutMs)
       label = classified.label
-      model = decideSubagentModel(label, e, sonnetForSimple)
+      const target = decideSubagentModel(label, e, sonnetForSimple) as RoutedModel | null
+      // Un subagent da spostare su `holdout` resta sul modello e sull'effort che avrebbe.
+      tested = target ? { model: target, arm: pickArm(holdout, turnFraction(e.tool_use_id ?? `${e.description}\n${e.prompt}`)) } : null
+      model = tested?.arm === 'lowered' ? tested.model : null
       const s = st.delta
       s.subagents.classified++
       if (label) s.subagents.labels[label]++
       if (model === MID_SUBAGENT_MODEL) s.subagents.toSonnet++
       else if (model) s.subagents.toHaiku++
       st.statsDirty = true
-      if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): ${classified.said}${model ? ` → ${model}` : ''}`)
+      if (log) $.ui.log(`[effort-router] subagent ${e.subagentType} (${e.description}): ${classified.said}${model ? ` → ${model}` : tested ? ` (holdout: niente ${tested.model})` : ''}`)
     }
     const result = await next(model ? { ...e, model } : e)
 
-    if (label && label !== 'complesso' && result.agentId) {
-      agentLabels.set(result.agentId, label)
-      if (agentLabels.size > MAX_TRACKED_AGENTS) agentLabels.delete(agentLabels.keys().next().value!)
+    if (result.agentId) {
+      if (label && label !== 'complesso' && tested?.arm !== 'holdout') remember(agentLabels, result.agentId, label)
+      if (tested) {
+        remember(agentExperiments, result.agentId, { ...tested, stretched: false, toolFailed: false })
+        st.delta.subagentExperiment[tested.model][tested.arm].agents++
+      }
     }
     // Senza il nostro intervento il tipo è finito su Haiku: lo sceglie da sé.
     // Se un tipo noto non ci finisce più, la sua definizione è cambiata.
@@ -388,7 +434,19 @@ export const register: Register = (on, options) => {
         else st.delta.subagents.raised++
         st.statsDirty = true
       }
-      return yield* next(effort ? { ...e, effort } : e)
+      const exp = agentExperiments.get(e.agentId)
+      if (exp && !exp.stretched && shouldEscalate(e.index, escalateAfter, true, exp.toolFailed)) {
+        exp.stretched = true
+        st.delta.subagentExperiment[exp.model][exp.arm].stretched++
+      }
+      const result = yield* next(effort ? { ...e, effort } : e)
+      if (exp) {
+        const arm = st.delta.subagentExperiment[exp.model][exp.arm]
+        arm.steps++
+        arm.output += result.usage?.output_tokens ?? 0
+        st.statsDirty = true
+      }
+      return result
     }
 
     const s = st.delta
@@ -472,7 +530,11 @@ export const register: Register = (on, options) => {
     // un cambio di effort.
     if (lastSent && result.usage && e.model === lastSent.model && startedAt - lastSent.at < CACHE_GAP_MS) {
       const changed = sent !== lastSent.effort
-      if (changed || e.index === 0) addUsage(changed ? s.cache.changed : s.cache.same, result.usage)
+      if (changed || e.index === 0) {
+        addUsage(changed ? s.cache.changed : s.cache.same, result.usage)
+        const today = (st.cacheDelta[day(startedAt)] ??= newCache())
+        addUsage(changed ? today.changed : today.same, result.usage)
+      }
     }
     lastSent = { effort: sent, model: e.model, at: await clockNow($) }
     return result
@@ -486,6 +548,9 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const watched = lowered || experiment?.arm === 'holdout'
     if (escalateOnError && watched && !e.agentId && result.isError) toolFailed = true
+    // Nell'esperimento dei subagent l'errore di un tool lo segna soltanto.
+    const exp = e.agentId ? agentExperiments.get(e.agentId) : undefined
+    if (escalateOnError && exp && result.isError) exp.toolFailed = true
     return result
   })
 
@@ -493,6 +558,11 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (!e.agentId && e.isAborted && experiment && e.turnId === appliedTurnId) {
       st.delta.experiment[experiment.label][experiment.arm].aborted++
+      st.statsDirty = true
+    }
+    const exp = e.agentId ? agentExperiments.get(e.agentId) : undefined
+    if (exp && e.isAborted) {
+      st.delta.subagentExperiment[exp.model][exp.arm].aborted++
       st.statsDirty = true
     }
     if (!e.agentId) await saveStats($, st)
