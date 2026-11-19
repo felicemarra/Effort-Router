@@ -330,17 +330,74 @@ test('subagent semplice: gira a medium per tutta la corsa', async ($, on) => {
   expect(seen).toEqual(['medium', 'medium'])
 })
 
+const NOW = Date.UTC(2026, 10, 19, 12)
+const BUSTING = { same: { n: 20, read: 950, total: 1000 }, changed: { n: 20, read: 100, total: 1000 } }
+
 test('cache invalidata dal cambio di effort: niente più abbassamento né classificazione', async ($, on) => {
   const seen: unknown[] = []
   const calls = { n: 0 }
   bottom(on, 'banale', seen, calls)
-  memoryStore(on, {
-    stats: { cache: { same: { n: 20, read: 950, total: 1000 }, changed: { n: 20, read: 100, total: 1000 } } },
-  })
+  on('clock.now', async () => ({ value: NOW }))
+  memoryStore(on, { cacheDays: { '2026-11-10': BUSTING } })
   await $.prompt.submit({ text: LUNGO_BANALE })
   await step($, 't1', 0)
   expect(seen).toEqual(['high'])
   expect(calls.n).toEqual(0)
+})
+
+test('cache invalidata oltre la finestra o solo nei totali: la protezione non scatta', async ($, on) => {
+  const seen: unknown[] = []
+  bottom(on, 'banale', seen)
+  on('clock.now', async () => ({ value: NOW }))
+  // 2026-11-05 è il quindicesimo giorno prima: fuori dai 14.
+  memoryStore(on, { stats: { cache: BUSTING }, cacheDays: { '2026-11-05': BUSTING } })
+  await $.prompt.submit({ text: LUNGO_BANALE })
+  await step($, 't1', 0)
+  expect(seen).toEqual(['low'])
+})
+
+test('misure della cache salvate per giorno, le vecchie escono; reset le azzera', async ($, on) => {
+  on('model.complete', async () => ({ value: { isAnswered: true, text: 'complesso', usage: USAGE } }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.status', async () => ({ value: undefined }))
+  on('prompt.submit', async ($: any, e: any) => ({ text: e.text }))
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  on('clock.now', async () => ({ value: NOW }))
+  on('turn.step', async function* ($: any, e: any) {
+    return {
+      turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn',
+      usage: { input_tokens: 100, output_tokens: 1, cache_read_input_tokens: 900, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' },
+    }
+  })
+  const data = memoryStore(on, { cacheDays: { '2026-11-05': BUSTING, '2026-11-19': BUSTING } })
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: LUNGO_COMPLESSO })
+  await step($, 't2', 0) // high dopo high: invariato
+  await complete($, 't2')
+  const days = data.get('cacheDays') as any
+  expect(Object.keys(days)).toEqual(['2026-11-19'])
+  expect(days['2026-11-19'].same).toEqual({ n: 21, read: 1850, total: 2000 })
+  const { text } = await $.command.run({ command: 'effort-router' })
+  expect(text).toContain('Verdetto, sugli ultimi 14 giorni (21 richieste con effort invariato · 20 cambiato)')
+  await $.command.run({ command: 'effort-router', args: 'reset' })
+  expect(data.get('cacheDays')).toEqual({})
+})
+
+test('subagent con modello esplicito e sessione a low: Haiku non viene chiamato', async ($, on) => {
+  const calls = { n: 0 }
+  spawnBottom(on, 'banale', calls)
+  const data = memoryStore(on)
+  on('turn.complete', async ($: any, e: any) => ({ text: e.answer }))
+  await step($, 't1', 0, 'low')
+  await spawnCall($, { model: 'sonnet' })
+  expect(calls.n).toEqual(0)
+  // Con la sessione a high l'effort del subagent si può abbassare: si classifica.
+  await step($, 't2', 0, 'high')
+  await spawnCall($, { model: 'sonnet' })
+  expect(calls.n).toEqual(1)
+  await complete($, 't2')
+  expect((data.get('stats') as any).subagents.skipped).toEqual(1)
 })
 
 test('statistiche salvate a fine turno e mostrate da /effort-router', async ($, on) => {

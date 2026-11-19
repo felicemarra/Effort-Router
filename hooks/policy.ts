@@ -233,6 +233,15 @@ export function subagentWorthClassifying(spawn: Spawn, knownFast: boolean): bool
 }
 
 /**
+ * Se la label di un subagent può cambiare qualcosa: il modello (nessuno l'ha
+ * ancora scelto) o l'effort. L'effort del subagent arriva solo con il suo
+ * primo step: si stima con quello della sessione (`current`).
+ */
+export function subagentCanChange(spawn: Spawn, current: unknown, raiseTo: Effort | null): boolean {
+  return canRouteSubagent(spawn) || canChange(current, raiseTo)
+}
+
+/**
  * L'effort per il loop di un subagent, o null. Il subagent parte già con
  * questo effort e lo tiene per tutta la corsa: nessun cambio, nessuna cache
  * da perdere. Un modello senza effort non si tocca.
@@ -271,9 +280,13 @@ export type Stats = {
   labels: Record<Label, number>
   // `failed`: nessuna label (timeout, errore, risposta non valida); `ms`: attesa totale.
   classifier: { calls: number; input: number; output: number; failed: number; ms: number }
-  subagents: { classified: number; toHaiku: number; toSonnet: number; lowered: number; raised: number; labels: Record<Label, number> }
-  cache: { same: CacheBucket; changed: CacheBucket }
+  // `skipped`: subagent non classificati perché nessuna label cambierebbe nulla.
+  subagents: { classified: number; skipped: number; toHaiku: number; toSonnet: number; lowered: number; raised: number; labels: Record<Label, number> }
+  cache: Cache
 }
+
+/** Le richieste con l'effort invariato e con l'effort cambiato. */
+export type Cache = { same: CacheBucket; changed: CacheBucket }
 
 // --- Esperimento -----------------------------------------------------------
 
@@ -374,7 +387,7 @@ export function newStats(now: number): Stats {
     },
     labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 },
     classifier: { calls: 0, input: 0, output: 0, failed: 0, ms: 0 },
-    subagents: { classified: 0, toHaiku: 0, toSonnet: 0, lowered: 0, raised: 0, labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 } },
+    subagents: { classified: 0, skipped: 0, toHaiku: 0, toSonnet: 0, lowered: 0, raised: 0, labels: { banale: 0, semplice: 0, complesso: 0, difficile: 0 } },
     cache: { same: { n: 0, read: 0, total: 0 }, changed: { n: 0, read: 0, total: 0 } },
   }
 }
@@ -424,6 +437,45 @@ export const CACHE_GAP_MS = 4 * 60_000
 export const CACHE_MIN_SAMPLES = 10
 /** Di quanto la quota servita dalla cache deve calare perché il cambio di effort la invalidi. */
 export const CACHE_DROP = 0.3
+/**
+ * Su quanti giorni si calcola il verdetto della cache: una misura vecchia
+ * (un'altra versione di Claude Code) esce dalla finestra, e una protezione
+ * scattata si spegne da sola quando i campioni con l'effort cambiato escono.
+ */
+export const CACHE_WINDOW_DAYS = 14
+
+/** Le misure della cache giorno per giorno (`YYYY-MM-DD`), per il verdetto. */
+export type CacheDays = Record<string, Cache>
+
+export function newCache(): Cache {
+  return { same: { n: 0, read: 0, total: 0 }, changed: { n: 0, read: 0, total: 0 } }
+}
+
+/** Le misure per giorno salvate, scartando le chiavi e i valori malformati. */
+export function readCacheDays(raw: unknown): CacheDays {
+  const out: CacheDays = {}
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out
+  for (const [key, value] of Object.entries(raw)) if (/^\d{4}-\d{2}-\d{2}$/.test(key)) out[key] = overlay(newCache(), value)
+  return out
+}
+
+/**
+ * Le misure salvate più quelle di una sessione, giorno per giorno, tenendo
+ * solo la finestra di CACHE_WINDOW_DAYS giorni che finisce a `now`.
+ */
+export function mergeCacheDays(saved: CacheDays, delta: CacheDays, now: number): CacheDays {
+  const from = day(now - (CACHE_WINDOW_DAYS - 1) * 86_400_000)
+  const out: CacheDays = {}
+  for (const key of new Set([...Object.keys(saved), ...Object.keys(delta)])) {
+    if (key >= from) out[key] = sum(saved[key] ?? newCache(), delta[key] ?? newCache())
+  }
+  return out
+}
+
+/** La somma delle misure di tutti i giorni. */
+export function sumCacheDays(days: CacheDays): Cache {
+  return Object.values(days).reduce((acc, cache) => sum(acc, cache), newCache())
+}
 
 export type CacheVerdict = 'ok' | 'busting' | 'unknown'
 
@@ -436,7 +488,7 @@ function ratio(bucket: CacheBucket): number {
  * dalla cache nelle richieste con l'effort invariato e in quelle con l'effort
  * cambiato. Servono abbastanza campioni di entrambe.
  */
-export function cacheVerdict(stats: Stats): CacheVerdict {
+export function cacheVerdict(stats: { cache: Cache }): CacheVerdict {
   const { same, changed } = stats.cache
   if (same.n < CACHE_MIN_SAMPLES || changed.n < CACHE_MIN_SAMPLES) return 'unknown'
   return ratio(same) - ratio(changed) > CACHE_DROP ? 'busting' : 'ok'
@@ -454,10 +506,11 @@ export function escalatedLabel(label: Label | null): 'banale' | 'semplice' | nul
 /**
  * Il resoconto di `/effort-router`: di una versione (`scope`) o del totale
  * (`scope` null). `total`, se c'è, aggiunge in coda una riga sul totale.
+ * `recent`: le misure degli ultimi CACHE_WINDOW_DAYS giorni, su cui si decide.
  */
-export function formatStats(stats: Stats, fastTypes: readonly string[], guard: boolean, scope: string | null = null, total: Stats | null = null): string {
+export function formatStats(stats: Stats, fastTypes: readonly string[], guard: boolean, scope: string | null = null, total: Stats | null = null, recent: Cache = stats.cache): string {
   const { same, changed } = stats.cache
-  const verdict = cacheVerdict(stats)
+  const verdict = cacheVerdict({ cache: recent })
   const verdictText = {
     ok: "il cambio di effort non invalida la cache ✓",
     busting: guard
@@ -472,7 +525,7 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     `Label: ${labelCounts(stats.labels)} · di cui difficili per ultrathink ${stats.deepThinking}`,
     `Rialzati a metà per label: banale ${stats.escalatedBy.banale} (${pct(stats.escalatedBy.banale, stats.labels.banale)}) · semplice ${stats.escalatedBy.semplice} (${pct(stats.escalatedBy.semplice, stats.labels.semplice)}) · per errore di un tool ${stats.escalatedOnError}`,
     `Classificatore Haiku: ${stats.classifier.calls} chiamate · ${stats.classifier.input} token in · ${stats.classifier.output} token out · senza label ${stats.classifier.failed} (${pct(stats.classifier.failed, stats.classifier.calls)}) · attesa media ${stats.classifier.calls ? `${Math.round(stats.classifier.ms / stats.classifier.calls)} ms` : '—'}`,
-    `Subagent: classificati ${stats.subagents.classified} · su Haiku ${stats.subagents.toHaiku} · su Sonnet ${stats.subagents.toSonnet} · effort abbassato ${stats.subagents.lowered} · alzato ${stats.subagents.raised}`,
+    `Subagent: classificati ${stats.subagents.classified} · saltati perché nulla cambierebbe ${stats.subagents.skipped} · su Haiku ${stats.subagents.toHaiku} · su Sonnet ${stats.subagents.toSonnet} · effort abbassato ${stats.subagents.lowered} · alzato ${stats.subagents.raised}`,
     `Label dei subagent: ${labelCounts(stats.subagents.labels)}`,
     '',
     'Esperimento (abbassati contro holdout, lasciati all\'effort della sessione):',
@@ -483,7 +536,7 @@ export function formatStats(stats: Stats, fastTypes: readonly string[], guard: b
     `Cache al primo step del turno (entro ${CACHE_GAP_MS / 60_000} min dalla richiesta prima):`,
     `  effort invariato: ${same.n} richieste · ${pct(same.read, same.total)} dell'input dalla cache`,
     `  effort cambiato:  ${changed.n} richieste · ${pct(changed.read, changed.total)} dell'input dalla cache`,
-    `Verdetto: ${verdictText}`,
+    `Verdetto, sugli ultimi ${CACHE_WINDOW_DAYS} giorni (${recent.same.n} richieste con effort invariato · ${recent.changed.n} cambiato): ${verdictText}`,
     '',
     `Tipi di subagent già su Haiku: ${fastTypes.length ? fastTypes.join(', ') : 'nessuno'}`,
     ...(total ? ['', `Tutte le versioni, dal ${day(total.since)}: ${total.turns} turni · abbassati ${total.lowered} · alzati ${total.raised} (\`/effort-router tutto\` per il dettaglio)`] : []),
@@ -500,7 +553,8 @@ function agentArmLine(a: AgentArmStats): string {
   return `${a.agents} subagent · step medi ${a.agents ? (a.steps / a.agents).toFixed(1) : '—'} · token out medi ${avg(a.output, a.agents)} · allungati ${pct(a.stretched, a.agents)} · interrotti ${pct(a.aborted, a.agents)}`
 }
 
-const day = (time: number) => new Date(time).toISOString().slice(0, 10)
+/** Il giorno (UTC, `YYYY-MM-DD`) di un istante. */
+export const day = (time: number) => new Date(time).toISOString().slice(0, 10)
 
 // Il nome della cartella di lavoro (l'ultimo segmento del percorso), per la status line.
 export function folderName(path: unknown): string | null {
